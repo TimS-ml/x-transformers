@@ -13,6 +13,7 @@ import os
 
 import wandb
 import numpy as np
+from datetime import datetime
 
 # constants
 NUM_BATCHES = int(1e5)
@@ -23,6 +24,13 @@ VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 1024
 SEQ_LEN = 1024
+SAVE_EVERY = 1000  # Save checkpoint every 1000 steps
+
+# --- Resume Configuration ---
+# Set to a specific checkpoint file path to resume, e.g., "checkpoints/20231027_1530_lr_0.0001_bs_4/model_step_1000.pt"
+# Set to None or empty string to train from scratch.
+RESUME_FROM_CHECKPOINT = None # Or path to checkpoint file
+# --- End Resume Configuration ---
 
 # Model parameters (for wandb config)
 MODEL_DIM = 512
@@ -31,8 +39,20 @@ MODEL_HEADS = 8
 SEQ_LEN = 1024
 
 # Initialize wandb
-# Generate a run name based on learning rate and batch size
-run_name = f"lr_{LEARNING_RATE}_bs_{BATCH_SIZE}"
+# Generate a run name based on learning rate, batch size, and current time
+current_time = datetime.now().strftime("%Y%m%d_%H%M")
+base_run_name = f"lr_{LEARNING_RATE}_bs_{BATCH_SIZE}"
+run_name = f"{current_time}_{base_run_name}"
+
+# Define checkpoint directory using the full run_name
+CHECKPOINT_DIR = os.path.join(os.getcwd(), "checkpoints", run_name)
+# Create directory only if not resuming from a checkpoint that would have already created it
+# or if RESUME_FROM_CHECKPOINT is None (training from scratch)
+if not RESUME_FROM_CHECKPOINT:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+elif RESUME_FROM_CHECKPOINT and not os.path.exists(os.path.dirname(RESUME_FROM_CHECKPOINT)):
+    # If resuming but the specific checkpoint's parent dir doesn't exist (e.g. typo in path), create current run's dir
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 wandb.init(
     project="x-transformers-tuning-practice", # Project name in wandb
@@ -77,6 +97,31 @@ model = TransformerWrapper(
 model = AutoregressiveWrapper(model)
 model.cuda()
 
+# optimizer (defined before potential checkpoint loading)
+optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+# --- Load Checkpoint if RESUME_FROM_CHECKPOINT is set ---
+start_step = 0
+if RESUME_FROM_CHECKPOINT and os.path.exists(RESUME_FROM_CHECKPOINT):
+    print(f"Resuming training from checkpoint: {RESUME_FROM_CHECKPOINT}")
+    checkpoint = torch.load(RESUME_FROM_CHECKPOINT)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optim.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_step = checkpoint.get('step', 0) + 1 # Resume from the next step
+    # Update CHECKPOINT_DIR to the resumed run's directory if different
+    # This ensures new checkpoints are saved in the resumed run's folder
+    resumed_run_checkpoint_dir = os.path.dirname(RESUME_FROM_CHECKPOINT)
+    if CHECKPOINT_DIR != resumed_run_checkpoint_dir:
+        print(f"Updating checkpoint directory to resumed run's directory: {resumed_run_checkpoint_dir}")
+        CHECKPOINT_DIR = resumed_run_checkpoint_dir
+    
+    print(f"Successfully loaded checkpoint. Resuming from step {start_step}.")
+    # Log to wandb that we are resuming
+    wandb.config.update({"resumed_from_checkpoint": RESUME_FROM_CHECKPOINT, "resumed_step": start_step}, allow_val_change=True)
+elif RESUME_FROM_CHECKPOINT:
+    print(f"Warning: Checkpoint path {RESUME_FROM_CHECKPOINT} not found. Training from scratch.")
+# --- End Load Checkpoint ---
+
 # prepare enwik8 data
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.join(script_dir, '..')
@@ -106,22 +151,20 @@ val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
 train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE, drop_last = True))
 val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last = True))
 
-# optimizer
-
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
 # training
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
+for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training', initial=start_step, total=NUM_BATCHES):
     model.train()
 
+    accumulated_loss = 0 # To store loss for checkpointing if needed before validation
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
         loss = model(next(train_loader))
         # Accumulate gradients
         (loss / GRADIENT_ACCUMULATE_EVERY).backward()
+        accumulated_loss += loss.item()
 
     # Calculate training metrics
-    train_loss_val = loss.item()
+    train_loss_val = accumulated_loss / GRADIENT_ACCUMULATE_EVERY
     train_perplexity_val = np.exp(train_loss_val)
     train_bpc_val = train_loss_val / np.log(2) # Bits Per Character
 
@@ -177,6 +220,22 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         generated_table = wandb.Table(columns=["step", "prime_text", "generated_text"])
         generated_table.add_data(i, prime, output_str)
         wandb.log({"generated_samples": generated_table, "step": i})
+
+    # Save checkpoint
+    if i % SAVE_EVERY == 0 and i > 0: # Also check i > 0 to avoid saving at step 0 if SAVE_EVERY is small
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, f"model_step_{i}.pt")
+        torch.save({
+            'step': i,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optim.state_dict(),
+            'loss': train_loss_val, # Save the most recent training loss
+        }, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
+
+        # Optionally, save checkpoint as a wandb artifact
+        artifact = wandb.Artifact(name=f"{run_name}-step_{i}", type="model")
+        artifact.add_file(checkpoint_path)
+        wandb.log_artifact(artifact)
 
 # Finish wandb run at the end of the script
 wandb.finish()
