@@ -10,12 +10,24 @@ import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 import os
+import re
 
 import wandb
 import numpy as np
 from datetime import datetime
 
 # constants
+# post_fix = ""
+post_fix = "_dim_1024_depth_12_heads_16"
+
+# MODEL_DIM = 512
+# MODEL_DEPTH = 6
+# MODEL_HEADS = 8
+
+MODEL_DIM = 1024
+MODEL_DEPTH = 12
+MODEL_HEADS = 16
+
 NUM_BATCHES = int(1e5)
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
@@ -26,37 +38,54 @@ GENERATE_LENGTH = 1024
 SEQ_LEN = 1024
 SAVE_EVERY = 1000  # Save checkpoint every 1000 steps
 
-# --- Resume Configuration ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.join(SCRIPT_DIR, '..')
+
 # Set to a specific checkpoint file path to resume, e.g., "checkpoints/20231027_1530_lr_0.0001_bs_4/model_step_1000.pt"
-# Set to None or empty string to train from scratch.
-RESUME_FROM_CHECKPOINT = None # Or path to checkpoint file
-# --- End Resume Configuration ---
+# RESUME_FROM_CHECKPOINT = os.path.join(PROJECT_ROOT, 'checkpoints', '250511_0948_lr_0.0001_bs_4')
+RESUME_FROM_CHECKPOINT = None
 
-# Model parameters (for wandb config)
-MODEL_DIM = 512
-MODEL_DEPTH = 6
-MODEL_HEADS = 8
-SEQ_LEN = 1024
+resolved_checkpoint_file = None
+if RESUME_FROM_CHECKPOINT:
+    if os.path.isdir(RESUME_FROM_CHECKPOINT):
+        checkpoint_files = []
+        for f_name in os.listdir(RESUME_FROM_CHECKPOINT):
+            match = re.fullmatch(r"model_step_(\d+)\.pt$", f_name)
+            if match:
+                step = int(match.group(1))
+                checkpoint_files.append((step, os.path.join(RESUME_FROM_CHECKPOINT, f_name)))
+        
+        if checkpoint_files:
+            checkpoint_files.sort(key=lambda x: x[0], reverse=True) # Sort by step, descending
+            resolved_checkpoint_file = checkpoint_files[0][1]
+            print(f"Identified latest checkpoint in directory '{RESUME_FROM_CHECKPOINT}': '{resolved_checkpoint_file}'")
+        else:
+            print(f"Warning: No checkpoint files (model_step_*.pt) found in directory '{RESUME_FROM_CHECKPOINT}'.")
+    elif os.path.isfile(RESUME_FROM_CHECKPOINT):
+        resolved_checkpoint_file = RESUME_FROM_CHECKPOINT
+    else:
+        # This case implies RESUME_FROM_CHECKPOINT was set but is not a valid file or directory
+        print(f"Warning: RESUME_FROM_CHECKPOINT path '{RESUME_FROM_CHECKPOINT}' is not a valid file or directory.")
 
-# Initialize wandb
-# Generate a run name based on learning rate, batch size, and current time
-current_time = datetime.now().strftime("%Y%m%d_%H%M")
-base_run_name = f"lr_{LEARNING_RATE}_bs_{BATCH_SIZE}"
-run_name = f"{current_time}_{base_run_name}"
-
-# Define checkpoint directory using the full run_name
-CHECKPOINT_DIR = os.path.join(os.getcwd(), "checkpoints", run_name)
-# Create directory only if not resuming from a checkpoint that would have already created it
-# or if RESUME_FROM_CHECKPOINT is None (training from scratch)
-if not RESUME_FROM_CHECKPOINT:
+if resolved_checkpoint_file:
+    # Derive run_name from the checkpoint's parent directory
+    run_name = os.path.basename(os.path.dirname(resolved_checkpoint_file))
+    wandb_run_id = run_name  # NOTE: Assumes run_name was used as ID for the original run
+    CHECKPOINT_DIR = os.path.dirname(resolved_checkpoint_file)
+    print(f"Attempting to resume run '{run_name}' from checkpoint: {resolved_checkpoint_file}")
+else:
+    current_time = datetime.now().strftime("%y%m%d_%H%M")
+    base_run_name = f"lr_{LEARNING_RATE}_bs_{BATCH_SIZE}{post_fix}"
+    run_name = f"{current_time}_{base_run_name}"
+    wandb_run_id = run_name
+    CHECKPOINT_DIR = os.path.join(os.getcwd(), "checkpoints", run_name)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-elif RESUME_FROM_CHECKPOINT and not os.path.exists(os.path.dirname(RESUME_FROM_CHECKPOINT)):
-    # If resuming but the specific checkpoint's parent dir doesn't exist (e.g. typo in path), create current run's dir
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    print(f"Starting new training run: {run_name}")
 
 wandb.init(
     project="x-transformers-tuning-practice", # Project name in wandb
     name=run_name, # Add the dynamic run name here
+    id=wandb_run_id,
     config={
         "learning_rate": LEARNING_RATE,
         "batch_size": BATCH_SIZE,
@@ -67,7 +96,8 @@ wandb.init(
         "model_depth": MODEL_DEPTH,
         "model_heads": MODEL_HEADS,
         "rotary_pos_emb": True # As per model definition
-    }
+    },
+    resume='allow' if resolved_checkpoint_file else 'never'
 )
 
 # helpers
@@ -102,30 +132,18 @@ optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # --- Load Checkpoint if RESUME_FROM_CHECKPOINT is set ---
 start_step = 0
-if RESUME_FROM_CHECKPOINT and os.path.exists(RESUME_FROM_CHECKPOINT):
-    print(f"Resuming training from checkpoint: {RESUME_FROM_CHECKPOINT}")
-    checkpoint = torch.load(RESUME_FROM_CHECKPOINT)
+if resolved_checkpoint_file:
+    checkpoint = torch.load(resolved_checkpoint_file)
     model.load_state_dict(checkpoint['model_state_dict'])
     optim.load_state_dict(checkpoint['optimizer_state_dict'])
-    start_step = checkpoint.get('step', 0) + 1 # Resume from the next step
-    # Update CHECKPOINT_DIR to the resumed run's directory if different
-    # This ensures new checkpoints are saved in the resumed run's folder
-    resumed_run_checkpoint_dir = os.path.dirname(RESUME_FROM_CHECKPOINT)
-    if CHECKPOINT_DIR != resumed_run_checkpoint_dir:
-        print(f"Updating checkpoint directory to resumed run's directory: {resumed_run_checkpoint_dir}")
-        CHECKPOINT_DIR = resumed_run_checkpoint_dir
+    start_step = checkpoint.get('step', 0) + 1
     
     print(f"Successfully loaded checkpoint. Resuming from step {start_step}.")
-    # Log to wandb that we are resuming
-    wandb.config.update({"resumed_from_checkpoint": RESUME_FROM_CHECKPOINT, "resumed_step": start_step}, allow_val_change=True)
-elif RESUME_FROM_CHECKPOINT:
-    print(f"Warning: Checkpoint path {RESUME_FROM_CHECKPOINT} not found. Training from scratch.")
+    wandb.config.update({"resumed_from_checkpoint": resolved_checkpoint_file, "resumed_step": start_step}, allow_val_change=True)
 # --- End Load Checkpoint ---
 
 # prepare enwik8 data
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.join(script_dir, '..')
-data_file_path = os.path.join(project_root, 'data', 'enwik8.gz')
+data_file_path = os.path.join(PROJECT_ROOT, 'data', 'enwik8.gz')
 
 with gzip.open(data_file_path) as file:
     data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
@@ -152,7 +170,6 @@ train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE, drop_la
 val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last = True))
 
 # training
-
 for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training', initial=start_step, total=NUM_BATCHES):
     model.train()
 
