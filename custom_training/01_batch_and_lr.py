@@ -185,21 +185,21 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
     # Calculate training metrics
     train_loss_val = accumulated_loss / GRADIENT_ACCUMULATE_EVERY
     train_perplexity_val = np.exp(train_loss_val)
-    train_bpc_val = train_loss_val / np.log(2) # Bits Per Character
-
-    # Log training metrics to wandb
-    wandb.log({
+    train_bpc_val = train_loss_val / np.log(2)  # Bits Per Character
+    
+    # Prepare all metrics to log
+    metrics = {
         "train/loss": train_loss_val,
         "train/perplexity": train_perplexity_val,
         "train/bpc": train_bpc_val
-    }, step=i)
+    }
     
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     
     # Log optimizer statistics
     if i % LOG_OPTIMIZER_STATS_EVERY == 0:
         optim_stats = calculate_optimizer_stats(optim)
-        wandb.log(optim_stats, step=i)
+        metrics.update(optim_stats)
     
     # Update parameters
     optim.step()
@@ -216,9 +216,7 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
             GRADIENT_ACCUMULATE_EVERY,
             num_devices
         )
-        wandb.log(throughput_metrics, step=i)
-    
-    print(f'training loss: {train_loss_val}')
+        metrics.update(throughput_metrics)
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
@@ -227,15 +225,17 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
             val_loss_val = loss.item()
             val_perplexity_val = np.exp(val_loss_val)
             val_bpc_val = val_loss_val / np.log(2)
-
-            # Log validation metrics to wandb
-            wandb.log({
+            
+            metrics.update({
                 "val/loss": val_loss_val,
                 "val/perplexity": val_perplexity_val,
-                "val/bpc": val_bpc_val,
-                "step": i
+                "val/bpc": val_bpc_val
             })
-            print(f'validation loss: {val_loss_val}') # Keep print for immediate feedback
+    
+    # Log all metrics at once
+    wandb.log(metrics, step=i)
+    
+    print(f'training loss: {train_loss_val}')
 
     if i % GENERATE_EVERY == 0:
         model.eval()
