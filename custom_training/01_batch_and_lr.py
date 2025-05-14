@@ -64,7 +64,7 @@ PROJECT_ROOT = os.path.join(SCRIPT_DIR, '..')
 # RESUME_FROM_CHECKPOINT = os.path.join(PROJECT_ROOT, 'checkpoints', '250511_0948_lr_0.0001_bs_4')
 RESUME_FROM_CHECKPOINT = None
 
-resolved_checkpoint_file = resume_checkpoint(RESUME_FROM_CHECKPOINT)
+resolved_checkpoint_file = resume_checkpoint(RESUME_FROM_CHECKPOINT) if RESUME_FROM_CHECKPOINT else None
 
 if resolved_checkpoint_file:
     # Derive run_name from the checkpoint's parent directory
