@@ -11,24 +11,34 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 import os
 import re
+import time
 
 import wandb
 import numpy as np
 from datetime import datetime
 
+from boring_utils.utils import cprint, tprint
+from boring_utils.nn_utils import (
+    cycle, resume_checkpoint, 
+    log_optimizer_stats, log_throughput
+)
+
+
 # constants
 # post_fix = ""
 post_fix = "_dim_1024_depth_12_heads_16"
 
-# MODEL_DIM = 512
-# MODEL_DEPTH = 6
-# MODEL_HEADS = 8
+# 19M -> req 380M tokens data
+MODEL_DIM = 512
+MODEL_DEPTH = 6
+MODEL_HEADS = 8
 
-MODEL_DIM = 1024
-MODEL_DEPTH = 12
-MODEL_HEADS = 16
+# 151.3M -> req 3B tokens data, enwik9 (~1B) is not enough
+# MODEL_DIM = 1024
+# MODEL_DEPTH = 12
+# MODEL_HEADS = 16
 
-NUM_BATCHES = int(1e5)
+NUM_BATCHES = 5 * int(1e4)
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 1e-4
@@ -38,6 +48,10 @@ GENERATE_LENGTH = 1024
 SEQ_LEN = 1024
 SAVE_EVERY = 1000  # Save checkpoint every 1000 steps
 
+# New constants for monitoring
+LOG_OPTIMIZER_STATS_EVERY = 100  # Log optimizer stats every 100 steps
+LOG_THROUGHPUT_EVERY = 10  # Log throughput every 10 steps
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.join(SCRIPT_DIR, '..')
 
@@ -45,27 +59,7 @@ PROJECT_ROOT = os.path.join(SCRIPT_DIR, '..')
 # RESUME_FROM_CHECKPOINT = os.path.join(PROJECT_ROOT, 'checkpoints', '250511_0948_lr_0.0001_bs_4')
 RESUME_FROM_CHECKPOINT = None
 
-resolved_checkpoint_file = None
-if RESUME_FROM_CHECKPOINT:
-    if os.path.isdir(RESUME_FROM_CHECKPOINT):
-        checkpoint_files = []
-        for f_name in os.listdir(RESUME_FROM_CHECKPOINT):
-            match = re.fullmatch(r"model_step_(\d+)\.pt$", f_name)
-            if match:
-                step = int(match.group(1))
-                checkpoint_files.append((step, os.path.join(RESUME_FROM_CHECKPOINT, f_name)))
-        
-        if checkpoint_files:
-            checkpoint_files.sort(key=lambda x: x[0], reverse=True) # Sort by step, descending
-            resolved_checkpoint_file = checkpoint_files[0][1]
-            print(f"Identified latest checkpoint in directory '{RESUME_FROM_CHECKPOINT}': '{resolved_checkpoint_file}'")
-        else:
-            print(f"Warning: No checkpoint files (model_step_*.pt) found in directory '{RESUME_FROM_CHECKPOINT}'.")
-    elif os.path.isfile(RESUME_FROM_CHECKPOINT):
-        resolved_checkpoint_file = RESUME_FROM_CHECKPOINT
-    else:
-        # This case implies RESUME_FROM_CHECKPOINT was set but is not a valid file or directory
-        print(f"Warning: RESUME_FROM_CHECKPOINT path '{RESUME_FROM_CHECKPOINT}' is not a valid file or directory.")
+resolved_checkpoint_file = resume_checkpoint(RESUME_FROM_CHECKPOINT)
 
 if resolved_checkpoint_file:
     # Derive run_name from the checkpoint's parent directory
@@ -101,11 +95,6 @@ wandb.init(
 )
 
 # helpers
-def cycle(loader):
-    while True:
-        for data in loader:
-            yield data
-
 def decode_token(token):
     return str(chr(max(32, token)))
 
@@ -127,6 +116,9 @@ model = TransformerWrapper(
 model = AutoregressiveWrapper(model)
 model.cuda()
 
+# Count number of devices
+num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
 # optimizer (defined before potential checkpoint loading)
 optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -145,6 +137,8 @@ if resolved_checkpoint_file:
 # prepare enwik8 data
 data_file_path = os.path.join(PROJECT_ROOT, 'data', 'enwik8.gz')
 
+# train data: 90M -> 90M tokens (chars)
+# test data: 5M
 with gzip.open(data_file_path) as file:
     data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
     train_x, valid_x = np.split(data, [int(90e6)])
@@ -172,6 +166,9 @@ val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last
 # training
 for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training', initial=start_step, total=NUM_BATCHES):
     model.train()
+    
+    # Start timing for throughput calculation
+    batch_start_time = time.time()
 
     accumulated_loss = 0 # To store loss for checkpointing if needed before validation
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
@@ -187,16 +184,38 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
 
     # Log training metrics to wandb
     wandb.log({
-        "train_loss": train_loss_val,
-        "train_perplexity": train_perplexity_val,
-        "train_bpc": train_bpc_val,
+        "train/loss": train_loss_val,
+        "train/perplexity": train_perplexity_val,
+        "train/bpc": train_bpc_val,
         "step": i
     })
     
     print(f'training loss: {train_loss_val}') # Keep print for immediate feedback
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+    
+    # Log optimizer statistics
+    if i % LOG_OPTIMIZER_STATS_EVERY == 0:
+        log_optimizer_stats(optim, wandb, i)
+    
+    # Update parameters
     optim.step()
     optim.zero_grad()
+    
+    # End timing and log throughput
+    batch_end_time = time.time()
+    if i % LOG_THROUGHPUT_EVERY == 0:
+        log_throughput(
+            BATCH_SIZE, 
+            SEQ_LEN, 
+            batch_start_time, 
+            batch_end_time, 
+            GRADIENT_ACCUMULATE_EVERY, 
+            wandb, 
+            i,
+            num_devices
+        )
+    
+    print(f'training loss: {train_loss_val}') # Keep print for immediate feedback
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
@@ -208,9 +227,9 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
 
             # Log validation metrics to wandb
             wandb.log({
-                "val_loss": val_loss_val,
-                "val_perplexity": val_perplexity_val,
-                "val_bpc": val_bpc_val,
+                "val/loss": val_loss_val,
+                "val/perplexity": val_perplexity_val,
+                "val/bpc": val_bpc_val,
                 "step": i
             })
             print(f'validation loss: {val_loss_val}') # Keep print for immediate feedback
@@ -250,9 +269,9 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
         print(f"Checkpoint saved to {checkpoint_path}")
 
         # Optionally, save checkpoint as a wandb artifact
-        artifact = wandb.Artifact(name=f"{run_name}-step_{i}", type="model")
-        artifact.add_file(checkpoint_path)
-        wandb.log_artifact(artifact)
+        # artifact = wandb.Artifact(name=f"{run_name}-step_{i}", type="model")
+        # artifact.add_file(checkpoint_path)
+        # wandb.log_artifact(artifact)
 
 # Finish wandb run at the end of the script
 wandb.finish()
