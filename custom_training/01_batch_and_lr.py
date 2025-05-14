@@ -20,7 +20,7 @@ from datetime import datetime
 from boring_utils.utils import cprint, tprint
 from boring_utils.nn_utils import (
     cycle, resume_checkpoint, 
-    log_optimizer_stats, log_throughput
+    calculate_optimizer_stats, calculate_throughput
 )
 
 from param_set import PARAM_SETS_BATCH_AND_LR
@@ -191,16 +191,15 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
     wandb.log({
         "train/loss": train_loss_val,
         "train/perplexity": train_perplexity_val,
-        "train/bpc": train_bpc_val,
-        "step": i
-    })
+        "train/bpc": train_bpc_val
+    }, step=i)
     
-    print(f'training loss: {train_loss_val}') # Keep print for immediate feedback
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     
     # Log optimizer statistics
     if i % LOG_OPTIMIZER_STATS_EVERY == 0:
-        log_optimizer_stats(optim, wandb, i)
+        optim_stats = calculate_optimizer_stats(optim)
+        wandb.log(optim_stats, step=i)
     
     # Update parameters
     optim.step()
@@ -209,18 +208,17 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
     # End timing and log throughput
     batch_end_time = time.time()
     if i % LOG_THROUGHPUT_EVERY == 0:
-        log_throughput(
+        throughput_metrics = calculate_throughput(
             BATCH_SIZE, 
             SEQ_LEN, 
             batch_start_time, 
             batch_end_time, 
-            GRADIENT_ACCUMULATE_EVERY, 
-            wandb, 
-            i,
+            GRADIENT_ACCUMULATE_EVERY,
             num_devices
         )
+        wandb.log(throughput_metrics, step=i)
     
-    print(f'training loss: {train_loss_val}') # Keep print for immediate feedback
+    print(f'training loss: {train_loss_val}')
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
