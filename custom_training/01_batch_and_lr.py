@@ -23,11 +23,10 @@ from boring_utils.nn_utils import (
     log_optimizer_stats, log_throughput
 )
 
+from param_set import PARAM_SETS_BATCH_AND_LR
+
 
 # constants
-# post_fix = ""
-post_fix = "_dim_1024_depth_12_heads_16"
-
 # 19M -> req 380M tokens data
 MODEL_DIM = 512
 MODEL_DEPTH = 6
@@ -38,10 +37,16 @@ MODEL_HEADS = 8
 # MODEL_DEPTH = 12
 # MODEL_HEADS = 16
 
-NUM_BATCHES = 5 * int(1e4)
-BATCH_SIZE = 4
-GRADIENT_ACCUMULATE_EVERY = 4
-LEARNING_RATE = 1e-4
+# post_fix = ""
+# post_fix = f"_dim_{MODEL_DIM}_depth_{MODEL_DEPTH}_heads_{MODEL_HEADS}"
+post_fix = "_19M"
+
+RUN_ID = 1
+
+NUM_BATCHES = int(1e5)
+BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN_ID]['batch_size']
+GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN_ID]['gradient_accumulate_every']
+LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN_ID]['learning_rate']
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 1024
