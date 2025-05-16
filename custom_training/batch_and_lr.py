@@ -1,6 +1,8 @@
 from x_transformers import TransformerWrapper, Decoder
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 
+import os
+import time
 import random
 import tqdm
 import gzip
@@ -9,9 +11,7 @@ import torch
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-import os
-import re
-import time
+from torch.amp import autocast, GradScaler
 
 import wandb
 import numpy as np
@@ -30,31 +30,43 @@ PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
 RUN_ID = ContextVar("RUN_ID", 1) 
 print(f"RUN_ID: {RUN_ID.value}")
 
+"""
+Phil Wang is using model_size:data = 1:5
 
-# post_fix = ""
-# post_fix = f"_dim_{MODEL_DIM}_depth_{MODEL_DEPTH}_heads_{MODEL_HEADS}"
+19M Model -> req 19M x 4 = 380M tokens data
+Under batch size 4, seq len 1000, number of batches = 19M x 4 / (4 x 1000) roughly 1e5 steps
+
+64M Model -> req 64M x 4 = 1280M tokens data
+Under batch size 4, seq len 1000, number of batches = 1280M x 4 / (4 x 1000) roughly 1.3 x 1e6 steps
+
+Usually GPU is the bottleneck, not vram. 
+"""
+
+post_fix = ""
+# post_fix += f"_dim_{MODEL_DIM}_depth_{MODEL_DEPTH}_heads_{MODEL_HEADS}"
+post_fix += "fp16"
 
 # constants
-# 19M -> req 380M tokens data, but Phil is using model_size:data = 1:5
-# post_fix = "_19M"
+# 19M -> req 380M tokens data
+# post_fix += "_19M"
 # MODEL_DIM = 512
 # MODEL_DEPTH = 6
 # MODEL_HEADS = 8
 
 # 57M -> req 1140M tokens data
-# post_fix = "_57M"
+# post_fix += "_57M"
 # MODEL_DIM = 768
 # MODEL_DEPTH = 8
 # MODEL_HEADS = 12
 
 # 64M -> req 1280M tokens data
-post_fix = "_64M"
+post_fix += "_64M"
 MODEL_DIM = 640
 MODEL_DEPTH = 12
 MODEL_HEADS = 10
 
 # 151.3M -> req 3B tokens data, enwik9 (~1B) is not enough
-# post_fix = "_151.3M"
+# post_fix += "_151.3M"
 # MODEL_DIM = 1024
 # MODEL_DEPTH = 12
 # MODEL_HEADS = 16
@@ -127,9 +139,9 @@ model = TransformerWrapper(
     num_tokens = 256,
     max_seq_len = SEQ_LEN,
     attn_layers = Decoder(
-        dim = MODEL_DIM, # Use constant for clarity
-        depth = MODEL_DEPTH, # Use constant for clarity
-        heads = MODEL_HEADS, # Use constant for clarity
+        dim = MODEL_DIM, 
+        depth = MODEL_DEPTH, 
+        heads = MODEL_HEADS, 
         rotary_pos_emb = True
     )
 )
@@ -192,18 +204,22 @@ val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
 train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE, drop_last = True))
 val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last = True))
 
-# training
+
+scaler = GradScaler()
+
+# Training
 for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training', initial=start_step, total=NUM_BATCHES):
     model.train()
     
-    # Start timing for throughput calculation
     batch_start_time = time.time()
+    accumulated_loss = 0
 
-    accumulated_loss = 0 # To store loss for checkpointing if needed before validation
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = model(next(train_loader))
-        # Accumulate gradients
-        (loss / GRADIENT_ACCUMULATE_EVERY).backward()
+        with autocast(device_type='cuda'):
+            loss = model(next(train_loader))
+        
+        # backward
+        scaler.scale(loss / GRADIENT_ACCUMULATE_EVERY).backward()
         accumulated_loss += loss.item()
 
     # Calculate training metrics
@@ -218,15 +234,21 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
         "train/bpc": train_bpc_val
     }
     
+    # Unscale gradients
+    scaler.unscale_(optim)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     
     # Log optimizer statistics
     if i % LOG_OPTIMIZER_STATS_EVERY == 0:
         optim_stats = calculate_optimizer_stats(optim)
         metrics.update(optim_stats)
+
+    # Update parameters
+    scaler.step(optim)
+    scaler.update()
     
     # Update parameters
-    optim.step()
+    # optim.step()
     optim.zero_grad()
     
     # End timing and log throughput
