@@ -22,31 +22,47 @@ from boring_utils.nn_utils import (
     cycle, resume_checkpoint, 
     calculate_optimizer_stats, calculate_throughput
 )
+from boring_utils.helpers import DEBUG, ContextVar
 
-from param_set import PARAM_SETS_BATCH_AND_LR
+from param_set import *
+PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
 
+RUN_ID = ContextVar("RUN_ID", 1) 
+print(f"RUN_ID: {RUN_ID.value}")
+
+
+# post_fix = ""
+# post_fix = f"_dim_{MODEL_DIM}_depth_{MODEL_DEPTH}_heads_{MODEL_HEADS}"
 
 # constants
-# 19M -> req 380M tokens data
-MODEL_DIM = 512
-MODEL_DEPTH = 6
-MODEL_HEADS = 8
+# 19M -> req 380M tokens data, but Phil is using model_size:data = 1:5
+# post_fix = "_19M"
+# MODEL_DIM = 512
+# MODEL_DEPTH = 6
+# MODEL_HEADS = 8
+
+# 57M -> req 1140M tokens data
+# post_fix = "_57M"
+# MODEL_DIM = 768
+# MODEL_DEPTH = 8
+# MODEL_HEADS = 12
+
+# 64M -> req 1280M tokens data
+post_fix = "_64M"
+MODEL_DIM = 640
+MODEL_DEPTH = 12
+MODEL_HEADS = 10
 
 # 151.3M -> req 3B tokens data, enwik9 (~1B) is not enough
+# post_fix = "_151.3M"
 # MODEL_DIM = 1024
 # MODEL_DEPTH = 12
 # MODEL_HEADS = 16
 
-# post_fix = ""
-# post_fix = f"_dim_{MODEL_DIM}_depth_{MODEL_DEPTH}_heads_{MODEL_HEADS}"
-post_fix = "_19M"
-
-RUN_ID = 1
-
 NUM_BATCHES = int(1e5)
-BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN_ID]['batch_size']
-GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN_ID]['gradient_accumulate_every']
-LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN_ID]['learning_rate']
+BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN_ID.value]['batch_size']
+GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN_ID.value]['gradient_accumulate_every']
+LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN_ID.value]['learning_rate']
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 1024
@@ -139,15 +155,23 @@ if resolved_checkpoint_file:
     wandb.config.update({"resumed_from_checkpoint": resolved_checkpoint_file, "resumed_step": start_step}, allow_val_change=True)
 # --- End Load Checkpoint ---
 
-# prepare enwik8 data
-data_file_path = os.path.join(PROJECT_ROOT, 'data', 'enwik8.gz')
+# prepare enwik data
+# data_file_path = os.path.join(PROJECT_ROOT, 'data', 'enwik8.gz')
+# # train data: 90M -> 90M tokens (chars)
+# # test data: 5M
+# with gzip.open(data_file_path) as file:
+#     data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+#     train_x, valid_x = np.split(data, [int(90e6)])
+#     data_train, data_val = torch.from_numpy(train_x), torch.from_numpy(valid_x)
 
-# train data: 90M -> 90M tokens (chars)
-# test data: 5M
+# train data: 320M tokens (chars)
+# test data: 20M
+data_file_path = os.path.join(PROJECT_ROOT, 'data', 'enwik9.gz')
 with gzip.open(data_file_path) as file:
-    data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-    train_x, valid_x = np.split(data, [int(90e6)])
+    data = np.frombuffer(file.read(int(340e6)), dtype=np.uint8).copy()
+    train_x, valid_x = np.split(data, [int(320e6)])
     data_train, data_val = torch.from_numpy(train_x), torch.from_numpy(valid_x)
+
 
 class TextSamplerDataset(Dataset):
     def __init__(self, data, seq_len):
