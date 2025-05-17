@@ -11,7 +11,10 @@ import torch
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-from torch.amp import autocast, GradScaler
+
+# pip install --no-build-isolation transformer_engine[pytorch]
+import transformer_engine.pytorch as te
+from transformer_engine.common import recipe
 
 import wandb
 import numpy as np
@@ -79,7 +82,7 @@ GENERATE_LENGTH = 1024
 SEQ_LEN = 1024
 SAVE_EVERY = 1000  # Save checkpoint every 1000 steps
 
-PRECISION = "fp16"
+PRECISION = "fp8"
 post_fix += f"_{PRECISION}"
 
 # New constants for monitoring
@@ -123,7 +126,7 @@ wandb.init(
         "model_dim": MODEL_DIM,
         "model_depth": MODEL_DEPTH,
         "model_heads": MODEL_HEADS,
-        "rotary_pos_emb": True,
+        "rotary_pos_emb": True, # As per model definition
         "precision": PRECISION
     },
     resume='allow' if resolved_checkpoint_file else 'never'
@@ -206,8 +209,12 @@ val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
 train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE, drop_last = True))
 val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last = True))
 
-
-scaler = GradScaler()
+# Create FP8 recipe configuration
+fp8_recipe = recipe.DelayedScaling(
+    fp8_format=recipe.Format.HYBRID,  # Use hybrid format: E4M3 for forward pass, E5M2 for backward pass
+    amax_history_len=16,              # Keep amax history for 16 steps
+    amax_compute_algo="max"           # Use max algorithm for amax computation
+)
 
 # Training
 for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training', initial=start_step, total=NUM_BATCHES):
@@ -217,11 +224,13 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
     accumulated_loss = 0
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        with autocast(device_type='cuda'):
+        # Use FP8 autocast context
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            # Forward pass
             loss = model(next(train_loader))
         
-        # backward
-        scaler.scale(loss / GRADIENT_ACCUMULATE_EVERY).backward()
+        # Backward pass (outside fp8_autocast context)
+        (loss / GRADIENT_ACCUMULATE_EVERY).backward()
         accumulated_loss += loss.item()
 
     # Calculate training metrics
@@ -236,8 +245,7 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
         "train/bpc": train_bpc_val
     }
     
-    # Unscale gradients
-    scaler.unscale_(optim)
+    # Clip gradient norm
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     
     # Log optimizer statistics
@@ -246,11 +254,7 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
         metrics.update(optim_stats)
 
     # Update parameters
-    scaler.step(optim)
-    scaler.update()
-    
-    # Update parameters
-    # optim.step()
+    optim.step()
     optim.zero_grad()
     
     # End timing and log throughput
@@ -269,7 +273,8 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = model(next(val_loader))
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                loss = model(next(val_loader))
             val_loss_val = loss.item()
             val_perplexity_val = np.exp(val_loss_val)
             val_bpc_val = val_loss_val / np.log(2)
@@ -292,11 +297,12 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
         # Corrected f-string usage for print
         print(f'{prime} \n\n {"*" * 100}')
 
-        sample = model.generate(
-            prompts = inp.unsqueeze(0), # Add batch dimension for generate function
-            seq_len = GENERATE_LENGTH,
-            cache_kv = True # Enable KV caching for faster generation
-        )
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            sample = model.generate(
+                prompts = inp.unsqueeze(0), # Add batch dimension for generate function
+                seq_len = GENERATE_LENGTH,
+                cache_kv = True # Enable KV caching for faster generation
+            )
 
         output_str = decode_tokens(sample[0].tolist()) # sample is a tensor, convert to list for decode_tokens
         print(output_str)
@@ -316,6 +322,7 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optim.state_dict(),
             'loss': train_loss_val, # Save the most recent training loss
+            'fp8_state': fp8_recipe.get_states()  # 保存FP8状态
         }, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
 
