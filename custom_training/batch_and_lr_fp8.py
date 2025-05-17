@@ -322,7 +322,6 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optim.state_dict(),
             'loss': train_loss_val, # Save the most recent training loss
-            'fp8_state': fp8_recipe.get_states()  # 保存FP8状态
         }, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
 
