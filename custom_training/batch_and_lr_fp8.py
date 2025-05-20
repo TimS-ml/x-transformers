@@ -30,8 +30,8 @@ from boring_utils.helpers import DEBUG, ContextVar
 from param_set import *
 PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
 
-RUN_ID = ContextVar("RUN_ID", 1) 
-print(f"RUN_ID: {RUN_ID.value}")
+RUN = ContextVar("RUN_ID", 1) 
+print(f"RUN_ID: {RUN.value}")
 
 """
 Phil Wang is using model_size:data = 1:5
@@ -73,9 +73,9 @@ MODEL_HEADS = 10
 # MODEL_HEADS = 16
 
 NUM_BATCHES = int(1e5)
-BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN_ID.value]['batch_size']
-GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN_ID.value]['gradient_accumulate_every']
-LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN_ID.value]['learning_rate']
+BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
+GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN.value]['gradient_accumulate_every']
+LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN.value]['learning_rate']
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 1024
@@ -103,7 +103,7 @@ if resolved_checkpoint_file:
     run_name = os.path.basename(os.path.dirname(resolved_checkpoint_file))
     wandb_run_id = run_name  # NOTE: Assumes run_name was used as ID for the original run
     CHECKPOINT_DIR = os.path.dirname(resolved_checkpoint_file)
-    print(f"Attempting to resume run '{run_name}' from checkpoint: {resolved_checkpoint_file}")
+    tprint(f"Attempting to resume run '{run_name}' from checkpoint: {resolved_checkpoint_file}")
 else:
     current_time = datetime.now().strftime("%y%m%d_%H%M")
     base_run_name = f"lr_{LEARNING_RATE}_bs_{BATCH_SIZE}{post_fix}"
@@ -111,7 +111,7 @@ else:
     wandb_run_id = run_name
     CHECKPOINT_DIR = os.path.join(os.getcwd(), "checkpoints", run_name)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    print(f"Starting new training run: {run_name}")
+    tprint(f"Starting new training run: {run_name}, run id: {RUN.value}")
 
 wandb.init(
     project="x-transformers-tuning-practice", # Project name in wandb
