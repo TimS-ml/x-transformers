@@ -30,8 +30,8 @@ from boring_utils.helpers import DEBUG, ContextVar
 from param_set import *
 PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
 
-RUN = ContextVar("RUN_ID", 1) 
-print(f"RUN_ID: {RUN.value}")
+RUN = ContextVar("RUN", 1) 
+RUN_NAME = ContextVar("RUN_NAME", None) # Added for new checkpoint logic
 
 """
 Phil Wang is using model_size:data = 1:5
@@ -76,6 +76,7 @@ NUM_BATCHES = int(1e5)
 BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
 GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN.value]['gradient_accumulate_every']
 LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN.value]['learning_rate']
+FORMATTED_LR = f"{LEARNING_RATE:.0e}" # Added for LR formatting
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 1024
@@ -92,11 +93,35 @@ LOG_THROUGHPUT_EVERY = 10  # Log throughput every 10 steps
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.join(SCRIPT_DIR, '..')
 
-# Set to a specific checkpoint file path to resume, e.g., "checkpoints/20231027_1530_lr_0.0001_bs_4/model_step_1000.pt"
-# RESUME_FROM_CHECKPOINT = os.path.join(PROJECT_ROOT, 'checkpoints', '250511_0948_lr_0.0001_bs_4')
-RESUME_FROM_CHECKPOINT = None
+CHECKPOINTS_BASE_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
+RESUME_TARGET_DIR = None  # This will be the directory path passed to resume_checkpoint
 
-resolved_checkpoint_file = resume_checkpoint(RESUME_FROM_CHECKPOINT) if RESUME_FROM_CHECKPOINT else None
+# NOTE: If RUN_NAME.value is None, RESUME_TARGET_DIR remains None, and a new run will start.
+if RUN_NAME.value:
+    tprint(f"Attempting to resume based on RUN_NAME: '{RUN_NAME.value}'")
+    
+    # Try RUN_NAME.value as a full directory name
+    potential_dir_path = os.path.join(CHECKPOINTS_BASE_DIR, RUN_NAME.value)
+    
+    if os.path.isdir(potential_dir_path):
+        RESUME_TARGET_DIR = potential_dir_path
+        tprint(f"Found exact match for checkpoint directory: {RESUME_TARGET_DIR}")
+    else:
+        # Try RUN_NAME.value as a prefix
+        print(f"No exact directory match for '{RUN_NAME.value}'. Searching for prefix in '{CHECKPOINTS_BASE_DIR}'...")
+        all_items = os.listdir(CHECKPOINTS_BASE_DIR)
+        # Filter for directories that start with the prefix
+        matching_dirs = [d for d in all_items if d.startswith(RUN_NAME.value) and os.path.isdir(os.path.join(CHECKPOINTS_BASE_DIR, d))]
+        
+        if matching_dirs:
+            matching_dirs.sort()  # Sort to get a consistent (e.g., lexicographically first) match
+            RESUME_TARGET_DIR = os.path.join(CHECKPOINTS_BASE_DIR, matching_dirs[0])
+            tprint(f"Found checkpoint directory by prefix '{RUN_NAME.value}': {RESUME_TARGET_DIR} (chose '{matching_dirs[0]}' from {len(matching_dirs)} match(es))")
+            
+    if not RESUME_TARGET_DIR:
+        tprint(f"Could not find a valid checkpoint directory for RUN_NAME '{RUN_NAME.value}'. A new run will be started.")
+
+resolved_checkpoint_file = resume_checkpoint(RESUME_TARGET_DIR) if RESUME_TARGET_DIR else None
 
 if resolved_checkpoint_file:
     # Derive run_name from the checkpoint's parent directory
@@ -106,10 +131,26 @@ if resolved_checkpoint_file:
     tprint(f"Attempting to resume run '{run_name}' from checkpoint: {resolved_checkpoint_file}")
 else:
     current_time = datetime.now().strftime("%y%m%d_%H%M")
-    base_run_name = f"lr_{LEARNING_RATE}_bs_{BATCH_SIZE}{post_fix}"
+    base_run_name = f"lr_{FORMATTED_LR}_bs_{BATCH_SIZE}{post_fix}"
     run_name = f"{current_time}_{base_run_name}"
     wandb_run_id = run_name
-    CHECKPOINT_DIR = os.path.join(os.getcwd(), "checkpoints", run_name)
+    CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints", run_name)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    tprint(f"Starting new training run: {run_name}, run id: {RUN.value}")
+
+if resolved_checkpoint_file:
+    # Derive run_name from the checkpoint's parent directory
+    run_name = os.path.basename(os.path.dirname(resolved_checkpoint_file))
+    wandb_run_id = run_name  # NOTE: Assumes run_name was used as ID for the original run
+    CHECKPOINT_DIR = os.path.dirname(resolved_checkpoint_file)
+    tprint(f"Attempting to resume run '{run_name}' from checkpoint: {resolved_checkpoint_file}")
+else:
+    current_time = datetime.now().strftime("%y%m%d_%H%M")
+    base_run_name = f"lr_{FORMATTED_LR}_bs_{BATCH_SIZE}{post_fix}" # Use FORMATTED_LR
+    run_name = f"{current_time}_{base_run_name}"
+    wandb_run_id = run_name
+    # Ensure CHECKPOINT_DIR is defined for new runs as well
+    CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints", run_name) # Corrected path
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     tprint(f"Starting new training run: {run_name}, run id: {RUN.value}")
 
@@ -118,7 +159,7 @@ wandb.init(
     name=run_name, # Add the dynamic run name here
     id=wandb_run_id,
     config={
-        "learning_rate": LEARNING_RATE,
+        "learning_rate": FORMATTED_LR, # Use FORMATTED_LR
         "batch_size": BATCH_SIZE,
         "seq_len": SEQ_LEN,
         "gradient_accumulate_every": GRADIENT_ACCUMULATE_EVERY,
