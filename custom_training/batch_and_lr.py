@@ -23,12 +23,27 @@ from boring_utils.nn_utils import (
     calculate_optimizer_stats, calculate_throughput
 )
 from boring_utils.helpers import DEBUG, ContextVar
-
 from param_set import *
-PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
 
 RUN = ContextVar("RUN", 0) 
 RUN_NAME = ContextVar("RUN_NAME", None) 
+SIZE = ContextVar("SIZE", 0)
+
+post_fix = ""
+if SIZE.value == 0:
+    PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_19M
+    PROJECT_NAME = "x-transformers-tuning-practice_19M"
+    post_fix += "_19M"
+    MODEL_DIM = 512
+    MODEL_DEPTH = 6
+    MODEL_HEADS = 8
+elif SIZE.value == 1:
+    PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
+    PROJECT_NAME = "x-transformers-tuning-practice"
+    post_fix += "_64M"
+    MODEL_DIM = 640
+    MODEL_DEPTH = 12
+    MODEL_HEADS = 10
 
 """
 Phil Wang is using model_size:data = 1:5
@@ -40,9 +55,6 @@ Under batch size 4, seq len 1000, number of batches = 19M x 4 / (4 x 1000) rough
 Under batch size 4, seq len 1000, number of batches = 1280M x 4 / (4 x 1000) roughly 1.3 x 1e6 steps
 
 Usually GPU is the bottleneck, not vram. 
-"""
-
-post_fix = ""
 
 # constants
 # 19M -> req 380M tokens data
@@ -58,16 +70,17 @@ post_fix = ""
 # MODEL_HEADS = 12
 
 # 64M -> req 1280M tokens data
-post_fix += "_64M"
-MODEL_DIM = 640
-MODEL_DEPTH = 12
-MODEL_HEADS = 10
+# post_fix += "_64M"
+# MODEL_DIM = 640
+# MODEL_DEPTH = 12
+# MODEL_HEADS = 10
 
 # 151.3M -> req 3B tokens data, enwik9 (~1B) is not enough
 # post_fix += "_151.3M"
 # MODEL_DIM = 1024
 # MODEL_DEPTH = 12
 # MODEL_HEADS = 16
+"""
 
 NUM_BATCHES = int(1e5)
 BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
@@ -136,7 +149,7 @@ else:
     tprint(f"Starting new training run: {run_name}, run id: {RUN.value}")
 
 wandb.init(
-    project="x-transformers-tuning-practice", # Project name in wandb
+    project=PROJECT_NAME, # Project name in wandb
     name=run_name, # Add the dynamic run name here
     id=wandb_run_id,
     config={
