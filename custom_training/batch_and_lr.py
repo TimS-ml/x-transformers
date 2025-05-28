@@ -37,6 +37,7 @@ if SIZE.value == 0:
     MODEL_DIM = 512
     MODEL_DEPTH = 6
     MODEL_HEADS = 8
+    NUM_BATCHES = int(1e5)
 elif SIZE.value == 1:
     PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
     PROJECT_NAME = "x-transformers-tuning-practice"
@@ -44,6 +45,7 @@ elif SIZE.value == 1:
     MODEL_DIM = 640
     MODEL_DEPTH = 12
     MODEL_HEADS = 10
+    NUM_BATCHES = int(1e5)  # but should be 1e6
 
 """
 Phil Wang is using model_size:data = 1:5
@@ -82,7 +84,6 @@ Usually GPU is the bottleneck, not vram.
 # MODEL_HEADS = 16
 """
 
-NUM_BATCHES = int(1e5)
 BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
 GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN.value]['gradient_accumulate_every']
 LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN.value]['learning_rate']
