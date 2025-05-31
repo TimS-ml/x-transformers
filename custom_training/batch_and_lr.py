@@ -37,7 +37,7 @@ if SIZE.value == 0:
     MODEL_DIM = 512
     MODEL_DEPTH = 6
     MODEL_HEADS = 8
-    NUM_BATCHES = int(1e5)
+    TOTAL_TRAINING_TOKENS = 380e6
 elif SIZE.value == 1:
     PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
     PROJECT_NAME = "x-transformers-tuning-practice"
@@ -45,7 +45,7 @@ elif SIZE.value == 1:
     MODEL_DIM = 640
     MODEL_DEPTH = 12
     MODEL_HEADS = 10
-    NUM_BATCHES = int(1e5)  # but should be 1e6
+    TOTAL_TRAINING_TOKENS = 1280e6
 
 """
 Phil Wang is using model_size:data = 1:5
@@ -93,6 +93,9 @@ GENERATE_EVERY  = 500
 GENERATE_LENGTH = 1024
 SEQ_LEN = 1024
 SAVE_EVERY = 1000  # Save checkpoint every 1000 steps
+
+TOKENS_PER_BATCH = BATCH_SIZE * SEQ_LEN * GRADIENT_ACCUMULATE_EVERY
+NUM_BATCHES = int(TOTAL_TRAINING_TOKENS / TOKENS_PER_BATCH)
 
 PRECISION = "fp16"
 post_fix += f"_{PRECISION}"
