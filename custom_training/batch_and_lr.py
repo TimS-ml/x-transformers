@@ -155,6 +155,112 @@ else:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     tprint(f"Starting new training run: {run_name}, run id: {RUN.value}")
 
+# instantiate GPT-like decoder model
+model = TransformerWrapper(
+    num_tokens = 256,
+    max_seq_len = SEQ_LEN,
+    attn_layers = Decoder(
+        dim = MODEL_DIM, 
+        depth = MODEL_DEPTH, 
+        heads = MODEL_HEADS, 
+        rotary_pos_emb = True
+    )
+)
+
+model = AutoregressiveWrapper(model)
+model.cuda()
+
+# Count number of devices
+num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
+# --- Load Checkpoint if RESUME_FROM_CHECKPOINT is set ---
+start_step = 0
+if resolved_checkpoint_file:
+    checkpoint = torch.load(resolved_checkpoint_file)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    start_step = checkpoint.get('step', 0) + 1
+    
+    # Check if checkpoint contains training config and use it for consistency
+    if 'training_config' in checkpoint:
+        saved_config = checkpoint['training_config']
+        BATCH_SIZE = saved_config.get('batch_size', BATCH_SIZE)
+        LEARNING_RATE = saved_config.get('learning_rate', LEARNING_RATE)
+        GRADIENT_ACCUMULATE_EVERY = saved_config.get('gradient_accumulate_every', GRADIENT_ACCUMULATE_EVERY)
+        FORMATTED_LR = f"{LEARNING_RATE:.0e}"
+        print(f"Using saved training config from checkpoint: batch_size={BATCH_SIZE}, lr={LEARNING_RATE}, grad_accum={GRADIENT_ACCUMULATE_EVERY}")
+    else:
+        # Try to get config from wandb API as fallback
+        try:
+            api = wandb.Api()
+            # Extract run name from checkpoint directory
+            checkpoint_dir = os.path.dirname(resolved_checkpoint_file)
+            wandb_run_name = os.path.basename(checkpoint_dir)
+            
+            # Method 1: Try to find the run by display name
+            runs = api.runs(f"{PROJECT_NAME}", 
+                          filters={"display_name": wandb_run_name})
+            runs_list = list(runs)
+            
+            wandb_run = None
+            if len(runs_list) > 0:
+                wandb_run = runs_list[0]
+                print(f"Found wandb run by display name: {wandb_run_name}")
+            else:
+                # Method 2: Try to use the run name as run ID directly
+                try:
+                    wandb_run = api.run(f"{PROJECT_NAME}/{wandb_run_name}")
+                    print(f"Found wandb run by ID: {wandb_run_name}")
+                except:
+                    print(f"Could not find wandb run with name/ID '{wandb_run_name}'")
+            
+            if wandb_run:
+                wandb_config = wandb_run.config
+                
+                # Use wandb config if available
+                config_updated = False
+                if 'batch_size' in wandb_config:
+                    BATCH_SIZE = wandb_config['batch_size']
+                    config_updated = True
+                if 'learning_rate' in wandb_config:
+                    LEARNING_RATE = float(wandb_config['learning_rate'])
+                    config_updated = True
+                if 'gradient_accumulate_every' in wandb_config:
+                    GRADIENT_ACCUMULATE_EVERY = wandb_config['gradient_accumulate_every']
+                    config_updated = True
+                
+                if config_updated:
+                    FORMATTED_LR = f"{LEARNING_RATE:.0e}"
+                    print(f"Using config from wandb API: batch_size={BATCH_SIZE}, lr={LEARNING_RATE}, grad_accum={GRADIENT_ACCUMULATE_EVERY}")
+                else:
+                    print(f"Wandb run found but no relevant config parameters. Using current config.")
+            
+            if not wandb_run:
+                print(f"Using current config: batch_size={BATCH_SIZE}, lr={LEARNING_RATE}, grad_accum={GRADIENT_ACCUMULATE_EVERY}")
+                
+        except Exception as e:
+            print(f"Failed to fetch config from wandb API: {e}")
+            print(f"Using current config: batch_size={BATCH_SIZE}, lr={LEARNING_RATE}, grad_accum={GRADIENT_ACCUMULATE_EVERY}")
+    
+    print(f"Successfully loaded checkpoint. Resuming from step {start_step}.")
+
+# Create optimizer after final learning rate is determined
+optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+# Load optimizer state if resuming from checkpoint
+if resolved_checkpoint_file:
+    checkpoint = torch.load(resolved_checkpoint_file)
+    if 'optimizer_state_dict' in checkpoint:
+        optim.load_state_dict(checkpoint['optimizer_state_dict'])
+        print(f"Loaded optimizer state from checkpoint.")
+# --- End Load Checkpoint ---
+
+# Calculate NUM_BATCHES after checkpoint loading with final parameters
+TOKENS_PER_BATCH = BATCH_SIZE * SEQ_LEN
+NUM_BATCHES = int(TOTAL_TRAINING_TOKENS / TOKENS_PER_BATCH)
+
+cprint(BATCH_SIZE, LEARNING_RATE, GRADIENT_ACCUMULATE_EVERY, NUM_BATCHES)
+
+# Initialize wandb after all parameters are finalized
 wandb.init(
     project=PROJECT_NAME, # Project name in wandb
     name=run_name, # Add the dynamic run name here
@@ -174,45 +280,16 @@ wandb.init(
     resume='allow' if resolved_checkpoint_file else 'never'
 )
 
+# Update wandb config if resumed from checkpoint
+if resolved_checkpoint_file:
+    wandb.config.update({"resumed_from_checkpoint": resolved_checkpoint_file, "resumed_step": start_step}, allow_val_change=True)
+
 # helpers
 def decode_token(token):
     return str(chr(max(32, token)))
 
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
-
-# instantiate GPT-like decoder model
-model = TransformerWrapper(
-    num_tokens = 256,
-    max_seq_len = SEQ_LEN,
-    attn_layers = Decoder(
-        dim = MODEL_DIM, 
-        depth = MODEL_DEPTH, 
-        heads = MODEL_HEADS, 
-        rotary_pos_emb = True
-    )
-)
-
-model = AutoregressiveWrapper(model)
-model.cuda()
-
-# Count number of devices
-num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
-
-# optimizer (defined before potential checkpoint loading)
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-# --- Load Checkpoint if RESUME_FROM_CHECKPOINT is set ---
-start_step = 0
-if resolved_checkpoint_file:
-    checkpoint = torch.load(resolved_checkpoint_file)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optim.load_state_dict(checkpoint['optimizer_state_dict'])
-    start_step = checkpoint.get('step', 0) + 1
-    
-    print(f"Successfully loaded checkpoint. Resuming from step {start_step}.")
-    wandb.config.update({"resumed_from_checkpoint": resolved_checkpoint_file, "resumed_step": start_step}, allow_val_change=True)
-# --- End Load Checkpoint ---
 
 # prepare enwik data
 # data_file_path = os.path.join(PROJECT_ROOT, 'data', 'enwik8.gz')
