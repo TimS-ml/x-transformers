@@ -28,24 +28,28 @@ from boring_utils.nn_utils import (
 from boring_utils.helpers import DEBUG, ContextVar
 
 from param_set import *
-PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
 
-RUN = ContextVar("RUN", 1) 
-RUN_NAME = ContextVar("RUN_NAME", None) # Added for new checkpoint logic
-
-"""
-Phil Wang is using model_size:data = 1:5
-
-19M Model -> req 19M x 4 = 380M tokens data
-Under batch size 4, seq len 1000, number of batches = 19M x 4 / (4 x 1000) roughly 1e5 steps
-
-64M Model -> req 64M x 4 = 1280M tokens data
-Under batch size 4, seq len 1000, number of batches = 1280M x 4 / (4 x 1000) roughly 1.3 x 1e6 steps
-
-Usually GPU is the bottleneck, not vram. 
-"""
+RUN = ContextVar("RUN", None) 
+RUN_NAME = ContextVar("RUN_NAME", None)
+SIZE = ContextVar("SIZE", 0)
 
 post_fix = ""
+if SIZE.value == 0:
+    PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_19M
+    PROJECT_NAME = "x-transformers-tuning-practice_19M"
+    post_fix += "_19M"
+    MODEL_DIM = 512
+    MODEL_DEPTH = 6
+    MODEL_HEADS = 8
+    TOTAL_TRAINING_TOKENS = 380e6
+elif SIZE.value == 1:
+    PARAM_SETS_BATCH_AND_LR = PARAM_SETS_BATCH_AND_LR_64M
+    PROJECT_NAME = "x-transformers-tuning-practice"
+    post_fix += "_64M"
+    MODEL_DIM = 640
+    MODEL_DEPTH = 12
+    MODEL_HEADS = 10
+    TOTAL_TRAINING_TOKENS = 1280e6
 
 # constants
 # 19M -> req 380M tokens data
@@ -72,63 +76,145 @@ MODEL_HEADS = 10
 # MODEL_DEPTH = 12
 # MODEL_HEADS = 16
 
-NUM_BATCHES = int(1e5)
-BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
-GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN.value]['gradient_accumulate_every']
-LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN.value]['learning_rate']
-FORMATTED_LR = f"{LEARNING_RATE:.0e}" # Added for LR formatting
-VALIDATE_EVERY  = 100
-GENERATE_EVERY  = 500
+# ========================================
+# Configuration Loading Logic
+# ========================================
+
+# Setup paths
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.join(SCRIPT_DIR, '..')
+CHECKPOINTS_BASE_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
+
+def load_run_config_from_checkpoint_or_wandb(checkpoint_file):
+    """Try to load training config from checkpoint or wandb API"""
+    checkpoint = torch.load(checkpoint_file)
+    
+    # Try checkpoint first
+    if 'training_config' in checkpoint:
+        config = checkpoint['training_config']
+        print(f"Loaded config from checkpoint: batch_size={config.get('batch_size')}, lr={config.get('learning_rate')}, grad_accum={config.get('gradient_accumulate_every')}")
+        return config
+    
+    # Fallback to wandb API
+    try:
+        api = wandb.Api()
+        checkpoint_dir = os.path.dirname(checkpoint_file)
+        wandb_run_name = os.path.basename(checkpoint_dir)
+        
+        # Try to find the run by display name
+        runs = api.runs("x-transformers-tuning-practice", 
+                      filters={"display_name": wandb_run_name})
+        runs_list = list(runs)
+        
+        wandb_run = None
+        if len(runs_list) > 0:
+            wandb_run = runs_list[0]
+            print(f"Found wandb run by display name: {wandb_run_name}")
+        else:
+            # Try to use the run name as run ID directly
+            try:
+                wandb_run = api.run(f"x-transformers-tuning-practice/{wandb_run_name}")
+                print(f"Found wandb run by ID: {wandb_run_name}")
+            except:
+                pass
+        
+        if wandb_run:
+            wandb_config = wandb_run.config
+            config = {
+                'batch_size': wandb_config.get('batch_size', 4),
+                'learning_rate': wandb_config.get('learning_rate', 1e-4),
+                'gradient_accumulate_every': wandb_config.get('gradient_accumulate_every', 1)
+            }
+            print(f"Loaded config from wandb: batch_size={config['batch_size']}, lr={config['learning_rate']}, grad_accum={config['gradient_accumulate_every']}")
+            return config
+    except Exception as e:
+        print(f"Failed to load config from wandb: {e}")
+    
+    # Return default config if all else fails
+    print("Using default config")
+    return {
+        'batch_size': 4,
+        'learning_rate': 1e-4,
+        'gradient_accumulate_every': 1
+    }
+
+# Scenario 1: Only RUN - start new training
+if RUN.value is not None and RUN_NAME.value is None:
+    BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
+    LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN.value]['learning_rate']
+    GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN.value]['gradient_accumulate_every']
+    resolved_checkpoint_file = None
+    print(f"Scenario 1: Starting new training with RUN {RUN.value} config")
+
+# Scenario 2: RUN_NAME + RUN - load checkpoint + override with RUN config
+elif RUN_NAME.value is not None and RUN.value is not None:
+    # Find checkpoint file
+    potential_dir_path = os.path.join(CHECKPOINTS_BASE_DIR, RUN_NAME.value)
+    if os.path.isdir(potential_dir_path):
+        RESUME_TARGET_DIR = potential_dir_path
+    else:
+        all_items = os.listdir(CHECKPOINTS_BASE_DIR)
+        matching_dirs = [d for d in all_items if d.startswith(RUN_NAME.value) and os.path.isdir(os.path.join(CHECKPOINTS_BASE_DIR, d))]
+        RESUME_TARGET_DIR = os.path.join(CHECKPOINTS_BASE_DIR, matching_dirs[0]) if matching_dirs else None
+    
+    resolved_checkpoint_file = resume_checkpoint(RESUME_TARGET_DIR) if RESUME_TARGET_DIR else None
+    
+    # Use RUN config (override checkpoint config)
+    BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
+    LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN.value]['learning_rate']
+    GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN.value]['gradient_accumulate_every']
+    print(f"Scenario 2: Loading checkpoint from {RUN_NAME.value} but using RUN {RUN.value} config")
+
+# Scenario 3: RUN_NAME only - load checkpoint + use saved config
+elif RUN_NAME.value is not None and RUN.value is None:
+    # Find checkpoint file
+    potential_dir_path = os.path.join(CHECKPOINTS_BASE_DIR, RUN_NAME.value)
+    if os.path.isdir(potential_dir_path):
+        RESUME_TARGET_DIR = potential_dir_path
+    else:
+        all_items = os.listdir(CHECKPOINTS_BASE_DIR)
+        matching_dirs = [d for d in all_items if d.startswith(RUN_NAME.value) and os.path.isdir(os.path.join(CHECKPOINTS_BASE_DIR, d))]
+        RESUME_TARGET_DIR = os.path.join(CHECKPOINTS_BASE_DIR, matching_dirs[0]) if matching_dirs else None
+    
+    resolved_checkpoint_file = resume_checkpoint(RESUME_TARGET_DIR) if RESUME_TARGET_DIR else None
+    
+    if resolved_checkpoint_file:
+        # Load config from checkpoint or wandb
+        saved_config = load_run_config_from_checkpoint_or_wandb(resolved_checkpoint_file)
+        BATCH_SIZE = saved_config.get('batch_size', 4)
+        LEARNING_RATE = saved_config.get('learning_rate', 1e-4)
+        GRADIENT_ACCUMULATE_EVERY = saved_config.get('gradient_accumulate_every', 1)
+        print(f"Scenario 3: Loading checkpoint and config from {RUN_NAME.value}")
+    else:
+        raise ValueError(f"Could not find checkpoint for RUN_NAME: {RUN_NAME.value}")
+
+# Scenario 4: Neither RUN nor RUN_NAME - error
+else:
+    raise ValueError("Must provide either RUN or RUN_NAME parameter")
+
+# Calculate derived values
+FORMATTED_LR = f"{LEARNING_RATE:.0e}"
+VALIDATE_EVERY = 100
+GENERATE_EVERY = 500
 GENERATE_LENGTH = 1024
 SEQ_LEN = 1024
-SAVE_EVERY = 1000  # Save checkpoint every 1000 steps
-
+SAVE_EVERY = 1000
 PRECISION = "fp8"
 post_fix += f"_{PRECISION}"
 
-# New constants for monitoring
-LOG_OPTIMIZER_STATS_EVERY = 100  # Log optimizer stats every 100 steps
-LOG_THROUGHPUT_EVERY = 10  # Log throughput every 10 steps
+# Calculate NUM_BATCHES after all config is finalized
+TOTAL_TRAINING_TOKENS = 1e9  # 1B tokens
+TOKENS_PER_BATCH = BATCH_SIZE * SEQ_LEN
+NUM_BATCHES = int(TOTAL_TRAINING_TOKENS / TOKENS_PER_BATCH)
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.join(SCRIPT_DIR, '..')
+print(f"Final config: BATCH_SIZE={BATCH_SIZE}, LEARNING_RATE={LEARNING_RATE}, GRADIENT_ACCUMULATE_EVERY={GRADIENT_ACCUMULATE_EVERY}, NUM_BATCHES={NUM_BATCHES}")
 
-CHECKPOINTS_BASE_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
-RESUME_TARGET_DIR = None  # This will be the directory path passed to resume_checkpoint
-
-# NOTE: If RUN_NAME.value is None, RESUME_TARGET_DIR remains None, and a new run will start.
-if RUN_NAME.value:
-    tprint(f"Attempting to resume based on RUN_NAME: '{RUN_NAME.value}'")
-    
-    # Try RUN_NAME.value as a full directory name
-    potential_dir_path = os.path.join(CHECKPOINTS_BASE_DIR, RUN_NAME.value)
-    
-    if os.path.isdir(potential_dir_path):
-        RESUME_TARGET_DIR = potential_dir_path
-        tprint(f"Found exact match for checkpoint directory: {RESUME_TARGET_DIR}")
-    else:
-        # Try RUN_NAME.value as a prefix
-        print(f"No exact directory match for '{RUN_NAME.value}'. Searching for prefix in '{CHECKPOINTS_BASE_DIR}'...")
-        all_items = os.listdir(CHECKPOINTS_BASE_DIR)
-        # Filter for directories that start with the prefix
-        matching_dirs = [d for d in all_items if d.startswith(RUN_NAME.value) and os.path.isdir(os.path.join(CHECKPOINTS_BASE_DIR, d))]
-        
-        if matching_dirs:
-            matching_dirs.sort()  # Sort to get a consistent (e.g., lexicographically first) match
-            RESUME_TARGET_DIR = os.path.join(CHECKPOINTS_BASE_DIR, matching_dirs[0])
-            tprint(f"Found checkpoint directory by prefix '{RUN_NAME.value}': {RESUME_TARGET_DIR} (chose '{matching_dirs[0]}' from {len(matching_dirs)} match(es))")
-            
-    if not RESUME_TARGET_DIR:
-        tprint(f"Could not find a valid checkpoint directory for RUN_NAME '{RUN_NAME.value}'. A new run will be started.")
-
-resolved_checkpoint_file = resume_checkpoint(RESUME_TARGET_DIR) if RESUME_TARGET_DIR else None
-
+# Setup run name and directories
 if resolved_checkpoint_file:
-    # Derive run_name from the checkpoint's parent directory
     run_name = os.path.basename(os.path.dirname(resolved_checkpoint_file))
-    wandb_run_id = run_name  # NOTE: Assumes run_name was used as ID for the original run
+    wandb_run_id = run_name
     CHECKPOINT_DIR = os.path.dirname(resolved_checkpoint_file)
-    tprint(f"Attempting to resume run '{run_name}' from checkpoint: {resolved_checkpoint_file}")
+    tprint(f"Resuming run '{run_name}' from checkpoint: {resolved_checkpoint_file}")
 else:
     current_time = datetime.now().strftime("%y%m%d_%H%M")
     base_run_name = f"lr_{FORMATTED_LR}_bs_{BATCH_SIZE}{post_fix}"
@@ -136,30 +222,20 @@ else:
     wandb_run_id = run_name
     CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints", run_name)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    tprint(f"Starting new training run: {run_name}, run id: {RUN.value}")
+    tprint(f"Starting new training run: {run_name}")
 
-if resolved_checkpoint_file:
-    # Derive run_name from the checkpoint's parent directory
-    run_name = os.path.basename(os.path.dirname(resolved_checkpoint_file))
-    wandb_run_id = run_name  # NOTE: Assumes run_name was used as ID for the original run
-    CHECKPOINT_DIR = os.path.dirname(resolved_checkpoint_file)
-    tprint(f"Attempting to resume run '{run_name}' from checkpoint: {resolved_checkpoint_file}")
-else:
-    current_time = datetime.now().strftime("%y%m%d_%H%M")
-    base_run_name = f"lr_{FORMATTED_LR}_bs_{BATCH_SIZE}{post_fix}" # Use FORMATTED_LR
-    run_name = f"{current_time}_{base_run_name}"
-    wandb_run_id = run_name
-    # Ensure CHECKPOINT_DIR is defined for new runs as well
-    CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints", run_name) # Corrected path
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    tprint(f"Starting new training run: {run_name}, run id: {RUN.value}")
+# New constants for monitoring
+LOG_OPTIMIZER_STATS_EVERY = 100  # Log optimizer stats every 100 steps
+LOG_THROUGHPUT_EVERY = 10  # Log throughput every 10 steps
+
+PROJECT_NAME = "x-transformers-tuning-practice"
 
 wandb.init(
-    project="x-transformers-tuning-practice", # Project name in wandb
-    name=run_name, # Add the dynamic run name here
+    project=PROJECT_NAME,
+    name=run_name,
     id=wandb_run_id,
     config={
-        "learning_rate": FORMATTED_LR, # Use FORMATTED_LR
+        "learning_rate": FORMATTED_LR,
         "batch_size": BATCH_SIZE,
         "seq_len": SEQ_LEN,
         "gradient_accumulate_every": GRADIENT_ACCUMULATE_EVERY,
@@ -167,7 +243,7 @@ wandb.init(
         "model_dim": MODEL_DIM,
         "model_depth": MODEL_DEPTH,
         "model_heads": MODEL_HEADS,
-        "rotary_pos_emb": True, # As per model definition
+        "rotary_pos_emb": True,
         "precision": PRECISION
     },
     resume='allow' if resolved_checkpoint_file else 'never'
@@ -198,20 +274,26 @@ model.cuda()
 # Count number of devices
 num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
-# optimizer (defined before potential checkpoint loading)
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-# --- Load Checkpoint if RESUME_FROM_CHECKPOINT is set ---
+# ========================================
+# Load model state and optimizer
+# ========================================
 start_step = 0
 if resolved_checkpoint_file:
     checkpoint = torch.load(resolved_checkpoint_file)
     model.load_state_dict(checkpoint['model_state_dict'])
-    optim.load_state_dict(checkpoint['optimizer_state_dict'])
     start_step = checkpoint.get('step', 0) + 1
-    
     print(f"Successfully loaded checkpoint. Resuming from step {start_step}.")
+
+# Create optimizer after final learning rate is determined
+optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+# Load optimizer state if resuming from checkpoint
+if resolved_checkpoint_file:
+    if 'optimizer_state_dict' in checkpoint:
+        optim.load_state_dict(checkpoint['optimizer_state_dict'])
+        print(f"Loaded optimizer state from checkpoint.")
+    
     wandb.config.update({"resumed_from_checkpoint": resolved_checkpoint_file, "resumed_step": start_step}, allow_val_change=True)
-# --- End Load Checkpoint ---
 
 # prepare enwik data
 # data_file_path = os.path.join(PROJECT_ROOT, 'data', 'enwik8.gz')
@@ -363,6 +445,15 @@ for i in tqdm.tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='traini
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optim.state_dict(),
             'loss': train_loss_val, # Save the most recent training loss
+            'training_config': {
+                'batch_size': BATCH_SIZE,
+                'learning_rate': LEARNING_RATE,
+                'gradient_accumulate_every': GRADIENT_ACCUMULATE_EVERY,
+                'seq_len': SEQ_LEN,
+                'model_dim': MODEL_DIM,
+                'model_depth': MODEL_DEPTH,
+                'model_heads': MODEL_HEADS
+            }
         }, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
 
