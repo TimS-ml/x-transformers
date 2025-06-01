@@ -51,31 +51,6 @@ elif SIZE.value == 1:
     MODEL_HEADS = 10
     TOTAL_TRAINING_TOKENS = 1280e6
 
-# constants
-# 19M -> req 380M tokens data
-# post_fix += "_19M"
-# MODEL_DIM = 512
-# MODEL_DEPTH = 6
-# MODEL_HEADS = 8
-
-# 57M -> req 1140M tokens data
-# post_fix += "_57M"
-# MODEL_DIM = 768
-# MODEL_DEPTH = 8
-# MODEL_HEADS = 12
-
-# 64M -> req 1280M tokens data
-post_fix += "_64M"
-MODEL_DIM = 640
-MODEL_DEPTH = 12
-MODEL_HEADS = 10
-
-# 151.3M -> req 3B tokens data, enwik9 (~1B) is not enough
-# post_fix += "_151.3M"
-# MODEL_DIM = 1024
-# MODEL_DEPTH = 12
-# MODEL_HEADS = 16
-
 # ========================================
 # Configuration Loading Logic
 # ========================================
@@ -140,9 +115,9 @@ def load_run_config_from_checkpoint_or_wandb(checkpoint_file):
 
 # Scenario 1: Only RUN - start new training
 if RUN.value is not None and RUN_NAME.value is None:
-    BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
-    LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN.value]['learning_rate']
-    GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN.value]['gradient_accumulate_every']
+    BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[int(RUN.value)]['batch_size']
+    LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[int(RUN.value)]['learning_rate']
+    GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[int(RUN.value)]['gradient_accumulate_every']
     resolved_checkpoint_file = None
     print(f"Scenario 1: Starting new training with RUN {RUN.value} config")
 
@@ -160,9 +135,9 @@ elif RUN_NAME.value is not None and RUN.value is not None:
     resolved_checkpoint_file = resume_checkpoint(RESUME_TARGET_DIR) if RESUME_TARGET_DIR else None
     
     # Use RUN config (override checkpoint config)
-    BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[RUN.value]['batch_size']
-    LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[RUN.value]['learning_rate']
-    GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[RUN.value]['gradient_accumulate_every']
+    BATCH_SIZE = PARAM_SETS_BATCH_AND_LR[int(RUN.value)]['batch_size']
+    LEARNING_RATE = PARAM_SETS_BATCH_AND_LR[int(RUN.value)]['learning_rate']
+    GRADIENT_ACCUMULATE_EVERY = PARAM_SETS_BATCH_AND_LR[int(RUN.value)]['gradient_accumulate_every']
     print(f"Scenario 2: Loading checkpoint from {RUN_NAME.value} but using RUN {RUN.value} config")
 
 # Scenario 3: RUN_NAME only - load checkpoint + use saved config

@@ -130,7 +130,7 @@ if RUN_NAME.value:
 if RUN.value is not None and RUN_NAME.value is not None:
     # Scenario: RUN_NAME + RUN - load checkpoint + use RUN's config
     print(f"Scenario: RUN_NAME + RUN - Loading checkpoint from {RUN_NAME.value} with RUN {RUN.value} config")
-    run_config = PARAM_SETS_BATCH_AND_LR[RUN.value]
+    run_config = PARAM_SETS_BATCH_AND_LR[int(RUN.value)]  # Convert to int
     BATCH_SIZE = run_config['batch_size']
     LEARNING_RATE = run_config['learning_rate']
     GRADIENT_ACCUMULATE_EVERY = run_config['gradient_accumulate_every']
@@ -139,7 +139,7 @@ if RUN.value is not None and RUN_NAME.value is not None:
 elif RUN.value is not None:
     # Scenario: Only RUN - start new training
     print(f"Scenario: RUN only - Starting new training with RUN {RUN.value} config")
-    run_config = PARAM_SETS_BATCH_AND_LR[RUN.value]
+    run_config = PARAM_SETS_BATCH_AND_LR[int(RUN.value)]  # Convert to int
     BATCH_SIZE = run_config['batch_size']
     LEARNING_RATE = run_config['learning_rate']
     GRADIENT_ACCUMULATE_EVERY = run_config['gradient_accumulate_every']
