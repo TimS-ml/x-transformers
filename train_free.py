@@ -1,20 +1,21 @@
 # /// script
 # dependencies = [
 #   "tqdm",
-#   "x-transformers",
-#   "wandb"
+#   "x-transformers>=2.11.0",
 # ]
 # ///
 
-from x_transformers import TransformerWrapper, Decoder
-from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
+from x_transformers.free_transformer import FreeTransformer
 
+from math import log
 import random
 import tqdm
 import gzip
 import numpy as np
+
 import torch
 import torch.optim as optim
+from torch import tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
@@ -25,10 +26,13 @@ BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 1e-4
 VALIDATE_EVERY  = 100
-GENERATE_EVERY  = 500
-GENERATE_LENGTH = 1024
-SEQ_LEN = 1024
-TRACK_EXPERIMENT_ONLINE = False
+GENERATE_EVERY  = 250
+GENERATE_LENGTH = 512
+PRIME_LENGTH = 32
+SEQ_LEN = 512
+
+LATENT_BITS = 8
+NAT = log(2)
 
 # helpers
 
@@ -45,21 +49,21 @@ def decode_tokens(tokens):
 
 # instantiate GPT-like decoder model
 
-model = TransformerWrapper(
+model = FreeTransformer(
     num_tokens = 256,
     max_seq_len = SEQ_LEN,
-    attn_layers = Decoder(
-        dim = 512,
-        depth = 6,
-        heads = 8,
-        rotary_pos_emb = True,
-        attn_orthog_projected_values = True,
-        attn_orthog_projected_values_per_head = True
-    )
-)
+    dim = 512,
+    heads = 8,
+    dec_head_depth = 4,
+    dec_tail_depth = 4,
+    enc_depth = 3,
+    kl_loss_weight = 1.,
+    per_token_latents = True,
+    kl_loss_threshold = NAT,
+    latent_bits = LATENT_BITS
+).cuda()
 
-model = AutoregressiveWrapper(model)
-model.cuda()
+one_hot_indices = torch.randint(0, 2 ** LATENT_BITS, ())
 
 # prepare enwik8 data
 
@@ -91,23 +95,16 @@ val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last
 
 optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-# experiment
-
-import wandb
-wandb.init(project = 'enwik8', mode = 'online' if TRACK_EXPERIMENT_ONLINE else 'disabled')
-wandb.run.name = 'baseline'
-
 # training
 
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = model(next(train_loader))
+        loss, (ar_loss, vae_kl_loss) = model(next(train_loader), return_all_losses = True)
         (loss / GRADIENT_ACCUMULATE_EVERY).backward()
 
-    print(f'training loss: {loss.item()}')
-    wandb.log(dict(loss = loss.item()))
+    print(f'training loss: {ar_loss.item():.4f}\t| kl loss: {vae_kl_loss.item():.4f}')
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
@@ -116,22 +113,21 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = model(next(val_loader))
-
-            print(f'validation loss: {loss.item()}')
-            wandb.log(dict(valid_loss = loss.item()))
+            loss, (ar_loss, _) = model(next(val_loader), return_all_losses = True)
+            print(f'validation loss: {ar_loss.item():.4f}')
 
     if i % GENERATE_EVERY == 0:
         model.eval()
-        inp = random.choice(val_dataset)[:-1]
+        inp = random.choice(val_dataset)[:PRIME_LENGTH]
         prime = decode_tokens(inp)
         print(f'%s \n\n %s', (prime, '*' * 100))
 
         sample = model.generate(
             prompts = inp,
             seq_len = GENERATE_LENGTH,
-            cache_kv = True
+            latents = one_hot_indices
         )
 
         output_str = decode_tokens(sample)
-        print(output_str)
+
+        print(f'\n\nlatent {one_hot_indices.tolist()} - ', output_str)

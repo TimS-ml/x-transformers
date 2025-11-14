@@ -67,6 +67,15 @@ def once(fn):
 
 print_once = once(print)
 
+# gumbel softmax attention related
+
+def log_prob_from_hard_attend(intermeds: Intermediates):
+    log_probs = intermeds.pre_softmax_attn.log_softmax(dim = -1)
+
+    one_hot = intermeds.post_softmax_attn.argmax(dim = -1, keepdim = True)
+    log_prob = log_probs.gather(-1, one_hot)
+    return rearrange(log_prob, 'b h i 1 -> b h i')
+
 # selective attention
 # https://arxiv.org/abs/2410.02703 - section 3.3
 # it is a technique to allow each token to prevent itself from being attended to by future tokens
@@ -171,6 +180,10 @@ class Attend(Module):
         qk_norm = False,
         l2_distance = False,
         sigmoid = False,
+        gumbel_softmax = False,
+        gumbel_softmax_temp = 1.,
+        gumbel_softmax_hard = True,
+        cog_signed = False,
         custom_attn_fn: Callable | None = None,
         flash = False,
         softclamp_logits = False,
@@ -203,7 +216,7 @@ class Attend(Module):
         assert not (flash and hard), 'hard attention not available for flash'
         assert not (flash and is_sparse_topk_attn), 'topk attention not available for flash'
 
-        assert at_most_one_of(sigmoid, hard, l2_distance, is_sparse_topk_attn)
+        assert at_most_one_of(sigmoid, hard, l2_distance, gumbel_softmax, is_sparse_topk_attn)
 
         if exists(custom_attn_fn):
             self.attn_fn = custom_attn_fn
@@ -213,6 +226,8 @@ class Attend(Module):
             self.attn_fn = one_hot_straight_through
         elif is_sparse_topk_attn:
             self.attn_fn = partial(sparse_topk_attn, sparse_topk = sparse_topk, straight_through = sparse_topk_straight_through)
+        elif gumbel_softmax:
+            self.attn_fn = partial(F.gumbel_softmax, dim = -1, tau = gumbel_softmax_temp, hard = gumbel_softmax_hard)
         else:
             softmax_fn = partial(F.softmax, dim = -1)
             self.attn_fn = partial(softmax_fn, dtype = torch.float32) if not qk_norm else softmax_fn
@@ -245,6 +260,12 @@ class Attend(Module):
         assert not (flash and selective), 'selective attention cannot work on flash attention'
         assert not (selective and not causal), 'selective attention is designed for autoregressive'
         self.selective = selective
+
+        # cog attention - negative weights for expressiveness
+        # https://openreview.net/forum?id=ezRrwwbxd0
+
+        assert not (flash and cog_signed), 'cog attention not available for flash'
+        self.cog_signed = cog_signed
 
         # l2 distance attention
 
@@ -495,6 +516,14 @@ class Attend(Module):
         if self.softclamp_logits:
             sim = softclamp(sim, self.logit_softclamp_value)
 
+        # pre-masking - handle cog by storing sign
+
+        if self.cog_signed:
+            sim_sign = sim.sign()
+            sim = sim.abs()
+
+        # masking
+
         i, j, dtype = *sim.shape[-2:], sim.dtype
 
         mask_value = -torch.finfo(sim.dtype).max
@@ -520,6 +549,11 @@ class Attend(Module):
         if self.head_learned_sink:
             # add learned attention sink
             attn_sink = repeat(self.head_attn_sink, 'h -> b h i 1', b = sim.shape[0], i = sim.shape[2])
+
+            if self.cog_signed:
+                attn_sink, attn_sink_sign = attn_sink.abs(), attn_sink.sign()
+                sim_sign = cat((attn_sink_sign, sim_sign), dim = -1)
+
             sim = cat((attn_sink, sim), dim = -1)
 
         pre_softmax_attn = sim
@@ -527,6 +561,11 @@ class Attend(Module):
         attn = self.attn_fn(sim)
 
         attn = attn.type(dtype)
+
+        # add back the sign
+
+        if self.cog_signed:
+            attn = attn * sim_sign
 
         post_softmax_attn = attn
 

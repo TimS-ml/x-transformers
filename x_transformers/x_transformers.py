@@ -4,6 +4,11 @@ from typing import Callable
 import math
 from copy import deepcopy
 from random import random, randrange
+from functools import partial, wraps
+from itertools import chain
+from collections import namedtuple
+from contextlib import nullcontext
+from dataclasses import dataclass
 from packaging import version
 
 import torch
@@ -12,11 +17,6 @@ import torch.nn.functional as F
 from torch import nn, einsum, tensor, Tensor, cat, stack, arange, is_tensor
 from torch.utils._pytree import tree_flatten, tree_unflatten, tree_map
 from torch.nn import Module, ModuleList, ModuleDict
-
-from functools import partial, wraps
-from collections import namedtuple
-from contextlib import nullcontext
-from dataclasses import dataclass
 
 from loguru import logger
 
@@ -161,6 +161,21 @@ def or_reduce(masks):
         head = head | rest
     return head
 
+def orthog_project(x, y):
+    x, packed_shape = pack([x], 'b *')
+    y, _ = pack([y], 'b *')
+
+    dtype = x.dtype
+    x, y = x.double(), y.double()
+    unit = F.normalize(y, dim = -1)
+
+    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
+    orthog = x - parallel
+
+    orthog, = unpack(orthog, packed_shape, 'b *')
+
+    return orthog.to(dtype)
+
 # cache helpers
 
 def get_cached_kvs(
@@ -274,6 +289,15 @@ def dropout_seq(seq, mask, dropout):
 class ReluSquared(Module):
     def forward(self, x):
         return F.relu(x) ** 2
+
+class SoLU(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = LayerNorm(dim)
+
+    def forward(self, x):
+        activated = x.softmax(dim = -1) * x
+        return self.norm(activated)
 
 # embedding
 
@@ -740,10 +764,13 @@ def apply_rotary_pos_emb(t, freqs, scale = 1):
     rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
 
     freqs = freqs[:, -seq_len:, :]
-    scale = scale[:, -seq_len:, :] if isinstance(scale, torch.Tensor) else scale
+    scale = scale[:, -seq_len:, :] if is_tensor(scale) else scale
 
     if t.ndim == 4 and freqs.ndim == 3:
         freqs = rearrange(freqs, 'b n d -> b 1 n d')
+
+        if is_tensor(scale):
+            scale = rearrange(scale, 'b n d -> b 1 n d')
 
     # partial rotary embeddings, Wang et al. GPT-J
     t, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
@@ -1236,6 +1263,7 @@ class FeedForward(Module):
         glu_mult_bias = False,
         swish = False,
         relu_squared = False,
+        solu = False,
         custom_activation = None,
         post_act_ln = False,
         dropout = 0.,
@@ -1247,10 +1275,14 @@ class FeedForward(Module):
         inner_dim = int(dim * mult)
         dim_out = default(dim_out, dim)
 
+        assert at_most_one_of(relu_squared, solu)
+
         if exists(custom_activation):
             activation = deepcopy(custom_activation)
         elif relu_squared:
             activation = ReluSquared()
+        elif solu:
+            activation = SoLU(inner_dim)
         elif swish:
             activation = nn.SiLU()
         else:
@@ -1278,6 +1310,17 @@ class FeedForward(Module):
 
         if zero_init_output:
             init_zero_(proj_out)
+
+    def muon_parameters(self):
+        weights = []
+
+        for m in self.modules():
+            if not isinstance(m, nn.Linear):
+                continue
+
+            weights.append(m.weight)
+
+        return weights
 
     def forward(
         self,
@@ -1325,7 +1368,11 @@ class Attention(Module):
         value_rmsnorm = False,      # used in alphagenome and bytedance's GR3 for further stability
         l2_distance = False,
         sigmoid = False,
+        gumbel_softmax = False,
+        gumbel_softmax_temp = 1.,
+        gumbel_softmax_hard = True,
         selective = False,
+        cog_signed = False,
         custom_attn_fn: Callable | None = None,
         hybrid_module: Module | None = None,
         hybrid_mask_kwarg: str | None = None,
@@ -1349,7 +1396,9 @@ class Attention(Module):
         softclamp_logits = False,
         logit_softclamp_value = 50.,
         learned_value_residual_mix = False,
-        laser = False,                # https://arxiv.org/abs/2411.03493v1
+        orthog_projected_values = False,  # https://openreview.net/forum?id=Ard2QzPAUK
+        orthog_projected_values_per_head = False,
+        laser = False,                    # https://arxiv.org/abs/2411.03493v1
         laser_softclamp_value = 15.,
         qkv_receive_diff_residuals = False,
         use_latent_q = False,
@@ -1382,6 +1431,7 @@ class Attention(Module):
         assert divisible_by(heads, kv_heads)
 
         self.kv_heads = kv_heads
+        self.groups = heads // kv_heads
 
         q_dim = dim_head * heads
         k_dim = dim_head * kv_heads
@@ -1530,7 +1580,11 @@ class Attention(Module):
             scale = qk_norm_scale if qk_norm else self.scale,
             l2_distance = l2_distance,
             sigmoid = sigmoid,
+            gumbel_softmax = gumbel_softmax,
+            gumbel_softmax_temp = gumbel_softmax_temp,
+            gumbel_softmax_hard = gumbel_softmax_hard,
             selective = selective,
+            cog_signed = cog_signed,
             custom_attn_fn = custom_attn_fn,
             add_zero_kv = add_zero_kv,
             head_learned_sink = head_learned_sink,
@@ -1570,6 +1624,14 @@ class Attention(Module):
         # attention on attention
 
         self.attn_on_attn = on_attn
+
+        # return orthogonal projected weighted values on original values
+        # "belief attention" - iclr 2026
+
+        self.orthog_projected_values = orthog_projected_values
+        self.orthog_projected_values_per_head = orthog_projected_values_per_head
+
+        out_dim *= max(1, int(orthog_projected_values) + int(orthog_projected_values_per_head))
 
         # hybrid module, in same vein as hymba https://www.arxiv.org/abs/2411.13676
 
@@ -1619,6 +1681,34 @@ class Attention(Module):
         if zero_init_output:
             init_zero_(self.to_out)
 
+    @torch.no_grad()
+    def qk_clip_(
+        self,
+        pre_softmax_attn: Tensor | Intermediates,
+        tau = 100 # this hyperparameter controls how large the attention logits can be
+    ):
+        """ proposed by the Moonshot AI team as a solution for Muon training instability """
+
+        if not is_tensor(pre_softmax_attn):
+            pre_softmax_attn = pre_softmax_attn.pre_softmax_attn
+
+        attn_logit_maxes = reduce(pre_softmax_attn, 'b h i j -> h', 'max')
+
+        qk_weight_scale = (tau / attn_logit_maxes).clamp(max = 1.).sqrt()
+
+        q_weight = self.to_q.weight
+        k_weight = self.to_k.weight
+
+        qk_dim, heads = q_weight.shape[0], qk_weight_scale.numel()
+
+        qk_weight_scale = repeat(qk_weight_scale, 'h -> (h expand)', expand = qk_dim // heads)
+
+        q_weight.mul_(qk_weight_scale)
+        k_weight.mul_(qk_weight_scale)
+
+    def muon_parameters(self):
+        return chain(self.to_v.parameters(), self.to_out.parameters())
+
     def forward(
         self,
         x,
@@ -1639,6 +1729,7 @@ class Attention(Module):
         value_residual = None,
         additional_key_values: tuple[Tensor, Tensor] | None = None,
         additional_key_value_mask = None,
+        kv_input_residual = None,
     ):
         b, n, h, kv_h, head_scale, num_mem_kv, device, has_context, qkv_receive_diff_residuals, is_multi_latent_attn = x.shape[0], x.shape[1], self.heads, self.kv_heads, self.head_scale, self.num_mem_kv, x.device, exists(context), self.qkv_receive_diff_residuals, self.use_latent_kv
 
@@ -1654,6 +1745,12 @@ class Attention(Module):
         else:
             kv_input = default(context, x)
             q_input, k_input, v_input = x, kv_input, kv_input
+
+        # done for free transformer
+
+        if exists(kv_input_residual):
+            k_input = k_input + kv_input_residual
+            v_input = v_input + kv_input_residual
 
         if exists(mem):
             k_input, mem_packed_shape = pack([mem, k_input], 'b * d')
@@ -1976,6 +2073,25 @@ class Attention(Module):
         if exists(self.to_v_gate):
             gates = self.to_v_gate(x)
             out = out * self.to_v_gate_activation(gates)
+
+        # maybe orthogonal projected weighted values - "belief" attention
+
+        if self.orthog_projected_values or self.orthog_projected_values_per_head:
+            orthog_projected = []
+            v_for_proj = repeat(orig_values, 'b h n d -> b n (g h d)', g = self.groups)
+
+            if self.orthog_projected_values:
+                projected = orthog_project(out, v_for_proj)
+                orthog_projected.append(projected)
+
+            if self.orthog_projected_values_per_head:
+                v_for_proj = rearrange(v_for_proj, 'b n (h d) -> b n h d', h = h)
+                out = rearrange(out, 'b n (h d) -> b n h d', h = h)
+                projected = orthog_project(out, v_for_proj)
+                projected = rearrange(projected, 'b n h d -> b n (h d)')
+                orthog_projected.append(projected)
+
+            out = cat(orthog_projected, dim = -1)
 
         # combine the heads
 
@@ -2437,6 +2553,34 @@ class AttentionLayers(Module):
 
         self.can_cache_kv = all([module.can_cache_kv for module in self.modules() if isinstance(module, Attention)])
 
+    def attn_qk_clip_(
+        self,
+        intermediates: LayerIntermediates,
+        tau = 100.
+    ):
+        # pairs up the attention intermediates with each attention module and does qk clip proposed by kimi team
+
+        layer_and_layer_types = (self.layers, self.layer_types)
+
+        attn_layers = [layer for (_, layer, _), layer_type in zip(self.layers, self.layer_types) if layer_type in ('a', 'c')]
+        attn_intermeds = intermediates.attn_intermediates
+
+        assert len(attn_layers) == len(attn_intermeds)
+
+        for attn_layer, attn_inter in zip(attn_layers, attn_intermeds):
+            attn_layer.qk_clip_(attn_inter, tau = tau)
+
+    def muon_parameters(self):
+        params = []
+
+        for m in self.modules():
+            if not isinstance(m, (Attention, FeedForward)):
+                continue
+
+            params.extend(list(m.muon_parameters()))
+
+        return params
+
     def forward(
         self,
         x,
@@ -2468,7 +2612,9 @@ class AttentionLayers(Module):
         route_additional_kv_to_top = True,
         condition = None,
         in_attn_cond = None, # https://arxiv.org/abs/2105.04090
-        layers_execute_order: tuple[int, ...] | None = None
+        layers_execute_order: tuple[int, ...] | None = None,
+        self_attn_kv_residuals: Tensor | None = None,
+        cross_attn_kv_residuals: Tensor | None = None
     ):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
         assert not (exists(condition) ^ self.need_condition), 'condition needs to be passed in if using adaptive layernorm or vice versa'
@@ -2646,6 +2792,23 @@ class AttentionLayers(Module):
 
         skip_hiddens = []
 
+        # for residuals to key value inputs for self and cross attention
+
+        self_attn_kv_residuals_iter = iter((None,))
+        cross_attn_kv_residuals_iter = iter((None,))
+
+        if exists(self_attn_kv_residuals):
+            if self_attn_kv_residuals.ndim == 3:
+                self_attn_kv_residuals = rearrange(self_attn_kv_residuals, '... ->  1 ...')
+
+            self_attn_kv_residuals_iter = iter(self_attn_kv_residuals)
+
+        if exists(cross_attn_kv_residuals):
+            if cross_attn_kv_residuals.ndim == 3:
+                cross_attn_kv_residuals = rearrange(cross_attn_kv_residuals, '... ->  1 ...')
+
+            cross_attn_kv_residuals_iter = iter(cross_attn_kv_residuals)
+
         # for value residuals
 
         first_self_attn_inter = None
@@ -2719,9 +2882,9 @@ class AttentionLayers(Module):
             # forward depending on layer type
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, value_residual = maybe_self_attn_value_residual, return_intermediates = True)
+                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, kv_input_residual = next(self_attn_kv_residuals_iter, None), value_residual = maybe_self_attn_value_residual, return_intermediates = True)
             elif layer_type == 'c':
-                out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), value_residual = maybe_cross_attn_value_residual, **cross_attn_rotary_pos_emb, return_intermediates = True)
+                out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), kv_input_residual = next(cross_attn_kv_residuals_iter, None), value_residual = maybe_cross_attn_value_residual, **cross_attn_rotary_pos_emb, return_intermediates = True)
             elif layer_type == 'f':
                 out = block(x, deep_embed = next(deep_embeds_iter, None))
 
@@ -3167,6 +3330,16 @@ class TransformerWrapper(Module):
             if not isinstance(self.pos_emb, always):
                 nn.init.normal_(self.pos_emb.emb.weight, std = 1e-5)
 
+    def attn_qk_clip_(
+        self,
+        intermediates: LayerIntermediates,
+        tau = 100.
+    ):
+        self.attn_layers.attn_qk_clip_(intermediates, tau = tau)
+
+    def muon_parameters(self):
+        return self.attn_layers.muon_parameters()
+
     def forward(
         self,
         x,
@@ -3327,6 +3500,7 @@ class TransformerWrapper(Module):
 
         kwargs = dict(
             **kwargs,
+            pos = pos,
             seq_pos_offset = seq_pos_offset,
             seq_start_pos = seq_start_pos,
             input_not_include_cache = input_not_include_cache

@@ -1,8 +1,7 @@
 # /// script
 # dependencies = [
-#   "tqdm",
 #   "x-transformers",
-#   "wandb"
+#   "adam-atan2-pytorch>=0.2.4",
 # ]
 # ///
 
@@ -18,6 +17,8 @@ import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from adam_atan2_pytorch import MuonAdamAtan2
+
 # constants
 
 NUM_BATCHES = int(1e5)
@@ -28,7 +29,6 @@ VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 1024
 SEQ_LEN = 1024
-TRACK_EXPERIMENT_ONLINE = False
 
 # helpers
 
@@ -52,13 +52,11 @@ model = TransformerWrapper(
         dim = 512,
         depth = 6,
         heads = 8,
-        rotary_pos_emb = True,
-        attn_orthog_projected_values = True,
-        attn_orthog_projected_values_per_head = True
+        rotary_pos_emb = True
     )
 )
 
-model = AutoregressiveWrapper(model)
+ar_wrapper = AutoregressiveWrapper(model)
 model.cuda()
 
 # prepare enwik8 data
@@ -89,13 +87,12 @@ val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last
 
 # optimizer
 
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-# experiment
-
-import wandb
-wandb.init(project = 'enwik8', mode = 'online' if TRACK_EXPERIMENT_ONLINE else 'disabled')
-wandb.run.name = 'baseline'
+optim = MuonAdamAtan2(
+    muon_params = model.muon_parameters(),
+    params = model.parameters(),
+    remove_muon_params_from_params = True,
+    lr = LEARNING_RATE
+)
 
 # training
 
@@ -103,12 +100,10 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = model(next(train_loader))
+        loss = ar_wrapper(next(train_loader))
         (loss / GRADIENT_ACCUMULATE_EVERY).backward()
 
     print(f'training loss: {loss.item()}')
-    wandb.log(dict(loss = loss.item()))
-
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
@@ -116,10 +111,8 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = model(next(val_loader))
-
+            loss = ar_wrapper(next(val_loader))
             print(f'validation loss: {loss.item()}')
-            wandb.log(dict(valid_loss = loss.item()))
 
     if i % GENERATE_EVERY == 0:
         model.eval()
@@ -127,7 +120,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         prime = decode_tokens(inp)
         print(f'%s \n\n %s', (prime, '*' * 100))
 
-        sample = model.generate(
+        sample = ar_wrapper.generate(
             prompts = inp,
             seq_len = GENERATE_LENGTH,
             cache_kv = True
