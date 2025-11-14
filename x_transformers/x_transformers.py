@@ -27,20 +27,44 @@ import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, pack, unpack
 
-# einstein notation
-
+# einstein notation convention used throughout this file
+# These letter conventions are used in einsum and rearrange operations:
 # b - batch
-# n - sequence
-# d - feature dimension
-# h - attention heads
-# i, j - sequence (source, target)
+# n - sequence length
+# d - feature dimension (model dimension)
+# h - number of attention heads
+# i, j - sequence positions (source, target) for attention operations
 
 # constants
 
+# Default dimension per attention head - standard value used across many transformer implementations
 DEFAULT_DIM_HEAD = 64
 
 @dataclass
 class LayerIntermediates:
+    """
+    Data class to store intermediate values during forward pass through transformer layers.
+
+    This is useful for:
+    - Caching key-value pairs for efficient autoregressive generation
+    - Accessing internal representations for analysis or auxiliary losses
+    - Implementing features like memory networks or residual connections across layers
+
+    Attributes:
+        hiddens: List of hidden states before final normalization (in pre-norm architecture)
+        last_hidden: Final hidden state after all attention layers and final normalization
+        attn_intermediates: List of attention intermediate values (pre/post softmax, cached kv, etc.)
+        layer_hiddens: Hidden states after each layer
+        attn_z_loss: Auxiliary z-loss for attention stability (from PaLM paper)
+        mems: Memory states for recurrent/memory-augmented transformers
+        last_layer_hiddens: Hidden states from the last layer only
+        initial_embeds: Initial embeddings before any layer processing
+        attn_pooled_tokens: Tokens after attention pooling
+        memory_tokens: Special memory tokens (e.g., from Memory Transformers)
+        logit_entropies: Entropy of output logits for analysis
+        logits: Output logits
+        cache_length: Length of the cached sequence for efficient generation
+    """
     hiddens:            list[Tensor] | None = None   # all hiddens, before the final norm (in pre-norm architecture)
     last_hidden:        Tensor | None = None         # very last hidden after all attention layers, after the final norm
     attn_intermediates: list[Intermediates] | None = None
@@ -55,37 +79,93 @@ class LayerIntermediates:
     logits:             Tensor | None = None
     cache_length:       int = 0
 
+# Helper to create linear layers without bias - commonly used in modern transformers for efficiency
 LinearNoBias = partial(nn.Linear, bias = False)
 
-# helpers
+# Helper functions for common operations and checks
 
 def exists(val):
+    """Check if a value is not None."""
     return val is not None
 
 def default(val, d):
+    """
+    Return value if it exists, otherwise return default.
+
+    Args:
+        val: Value to check
+        d: Default value or callable that returns default value
+
+    Returns:
+        val if exists(val), otherwise d() if callable(d) else d
+    """
     if exists(val):
         return val
     return d() if callable(d) else d
 
 def identity(t, *args, **kwargs):
+    """Identity function - returns input unchanged."""
     return t
 
 def first(it, default = None):
+    """
+    Get first element from sequence or default if empty.
+
+    Args:
+        it: Sequence to get first element from
+        default: Value to return if sequence is empty
+
+    Returns:
+        First element or default
+    """
     return it[0] if len(it) > 0 else default
 
 def is_empty(x):
+    """Check if a sequence is empty."""
     return len(x) == 0
 
 def cast_tuple(val, depth = 1):
+    """
+    Convert value to tuple by repeating it depth times if not already a tuple.
+
+    Args:
+        val: Value to convert
+        depth: Number of times to repeat value if not a tuple
+
+    Returns:
+        Original value if tuple, otherwise (val,) * depth
+    """
     return val if isinstance(val, tuple) else (val,) * depth
 
 def divisible_by(num, den):
+    """Check if num is divisible by den with no remainder."""
     return (num % den) == 0
 
 def detach_all(obj):
+    """
+    Recursively detach all tensors in a pytree structure from computation graph.
+
+    Args:
+        obj: Pytree structure containing tensors
+
+    Returns:
+        Same structure with all gradients detached
+    """
     return tree_map(lambda t: t.detach() if is_tensor(t) and t.requires_grad else t, obj)
 
 def maybe(fn = None):
+    """
+    Decorator that makes a function handle None inputs gracefully.
+
+    If input is None, returns None without calling the function.
+    Otherwise, calls the function normally.
+
+    Args:
+        fn: Function to wrap
+
+    Returns:
+        Wrapped function that handles None inputs
+    """
     if not exists(fn):
         fn = identity
 
@@ -97,57 +177,146 @@ def maybe(fn = None):
     return inner
 
 def at_most_one_of(*bools):
+    """
+    Check that at most one of the boolean values is True.
+
+    Args:
+        *bools: Variable number of boolean values
+
+    Returns:
+        True if at most one argument is True
+    """
     return sum(map(int, bools)) <= 1
 
 class always():
+    """Callable that always returns the same value, regardless of input."""
     def __init__(self, val):
         self.val = val
     def __call__(self, *args, **kwargs):
         return self.val
 
 class not_equals():
+    """Callable that checks if input is not equal to stored value."""
     def __init__(self, val):
         self.val = val
     def __call__(self, x, *args, **kwargs):
         return x != self.val
 
 class equals():
+    """Callable that checks if input equals stored value."""
     def __init__(self, val):
         self.val = val
     def __call__(self, x, *args, **kwargs):
         return x == self.val
 
 def Sequential(*modules):
+    """
+    Create nn.Sequential, filtering out None modules.
+
+    Args:
+        *modules: Variable number of modules (can include None)
+
+    Returns:
+        nn.Sequential with only non-None modules
+    """
     return nn.Sequential(*filter(exists, modules))
 
-# tensor helpers
+# Tensor helper functions for common operations
 
 def log(t, eps = 1e-20):
+    """
+    Numerically stable logarithm by clamping minimum value.
+
+    Args:
+        t: Input tensor
+        eps: Minimum value before taking log (prevents log(0))
+
+    Returns:
+        log(t) with values clamped to avoid -inf
+    """
     return t.clamp(min = eps).log()
 
 def max_neg_value(tensor):
+    """
+    Get the maximum negative value for a tensor's dtype.
+
+    Used for masking in attention to effectively zero out positions.
+
+    Args:
+        tensor: Tensor to get dtype from
+
+    Returns:
+        Maximum negative value for the tensor's dtype
+    """
     return -torch.finfo(tensor.dtype).max
 
 def l2norm(t, groups = 1):
+    """
+    L2 normalization with optional grouping (group normalization style).
+
+    Args:
+        t: Input tensor (..., d)
+        groups: Number of groups to split dimension into
+
+    Returns:
+        L2 normalized tensor of same shape
+    """
     t = rearrange(t, '... (g d) -> ... g d', g = groups)
     t = F.normalize(t, p = 2, dim = -1)
     return rearrange(t, '... g d -> ... (g d)')
 
 def softclamp(t, value):
+    """
+    Soft clamping using tanh - smoother alternative to hard clipping.
+
+    This smoothly bounds values to [-value, value] range.
+
+    Args:
+        t: Input tensor
+        value: Clamping threshold
+
+    Returns:
+        Soft-clamped tensor
+    """
     return (t / value).tanh() * value
 
 def masked_mean(t, mask = None, dim = 1):
+    """
+    Compute mean of tensor along dimension, respecting mask.
+
+    Args:
+        t: Input tensor
+        mask: Boolean mask (True = keep, False = ignore)
+        dim: Dimension to take mean over
+
+    Returns:
+        Masked mean with proper handling of variable length sequences
+    """
     if not exists(mask):
         return t.mean(dim = dim)
 
+    # Expand mask to match tensor dimensions
     dims_append = (1,) * (t.ndim - mask.ndim)
     mask = mask.reshape(*mask.shape, *dims_append)
 
+    # Compute mean only over non-masked positions
     num = (t * mask).sum(dim = dim)
     den = mask.sum(dim = dim).clamp(min = 1.)
     return num / den
 
 def pad_at_dim(t, pad: tuple[int, int], dim = -1, value = 0.):
+    """
+    Pad tensor at specific dimension.
+
+    Args:
+        t: Input tensor
+        pad: Tuple of (left_pad, right_pad)
+        dim: Dimension to pad
+        value: Value to use for padding
+
+    Returns:
+        Padded tensor
+    """
     if pad == (0, 0):
         return t
 
@@ -156,19 +325,43 @@ def pad_at_dim(t, pad: tuple[int, int], dim = -1, value = 0.):
     return F.pad(t, (*zeros, *pad), value = value)
 
 def or_reduce(masks):
+    """
+    Reduce list of boolean masks using OR operation.
+
+    Args:
+        masks: List of boolean tensors
+
+    Returns:
+        Single mask that is True where any input mask is True
+    """
     head, *body = masks
     for rest in body:
         head = head | rest
     return head
 
 def orthog_project(x, y):
+    """
+    Project x onto the orthogonal complement of y (remove y component from x).
+
+    This computes the component of x that is perpendicular to y.
+    Used in "belief attention" to get orthogonal projections.
+
+    Args:
+        x: Vector to project
+        y: Vector to project away from
+
+    Returns:
+        Component of x orthogonal to y
+    """
     x, packed_shape = pack([x], 'b *')
     y, _ = pack([y], 'b *')
 
     dtype = x.dtype
+    # Use double precision for numerical stability
     x, y = x.double(), y.double()
     unit = F.normalize(y, dim = -1)
 
+    # Remove parallel component to get orthogonal component
     parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
     orthog = x - parallel
 
@@ -176,12 +369,23 @@ def orthog_project(x, y):
 
     return orthog.to(dtype)
 
-# cache helpers
+# Cache helpers for efficient autoregressive generation
 
 def get_cached_kvs(
     cache: LayerIntermediates
 ) -> list[tuple[Tensor, Tensor]]:
+    """
+    Extract cached key-value pairs from layer intermediates.
 
+    Used for efficient autoregressive generation where we cache keys and values
+    from previous tokens to avoid recomputation.
+
+    Args:
+        cache: Layer intermediates containing cached key-value pairs
+
+    Returns:
+        List of (key, value) tuples for each attention layer
+    """
     cached_kvs = []
 
     for attn_intermediate in cache.attn_intermediates:
@@ -189,54 +393,108 @@ def get_cached_kvs(
 
     return cached_kvs
 
-# entropy
+# Entropy calculation for analysis and auxiliary losses
 
 def calc_entropy(
     t: Tensor,
     is_prob = False
 ):
+    """
+    Calculate entropy of probability distribution.
+
+    Args:
+        t: Input tensor (logits or probabilities)
+        is_prob: If True, t is already a probability distribution
+
+    Returns:
+        Entropy values: -sum(p * log(p))
+    """
     prob = t.softmax(dim = -1) if not is_prob else t
     return -(prob * log(prob)).sum(dim = -1)
 
-# auxiliary loss helpers
+# Auxiliary loss helpers for training stability
 
 def calc_z_loss(
     pre_softmax_attns: list[Tensor],
     mask = None,
     weight = 1.
 ):
-    # the same loss applied to the mixture of experts router logits in https://arxiv.org/abs/2202.08906
-    # in the paper, in a tiny footnote, they mention using it on attention logits with stabilizing effects
-    # also used in PaLM as one of the measures
+    """
+    Calculate z-loss for attention logits to encourage stability.
 
+    Originally proposed for mixture of experts in https://arxiv.org/abs/2202.08906.
+    The paper mentions (in a footnote) using it on attention logits with stabilizing effects.
+    Also used in PaLM as one of the auxiliary losses.
+
+    The z-loss penalizes large logit values by computing the squared logsumexp.
+
+    Args:
+        pre_softmax_attns: List of attention logits before softmax
+        mask: Optional mask for variable length sequences
+        weight: Weight for the loss term
+
+    Returns:
+        Scalar z-loss value
+    """
     lse = 0.
 
+    # Accumulate logsumexp across all attention layers
     for attn in pre_softmax_attns:
         lse = lse + attn.logsumexp(dim = -1)
 
+    # Square the logsumexp (penalizes large logits)
     loss = torch.square(lse)
     loss = reduce(loss, 'b h n -> b n', 'sum')
 
     if not exists(mask):
         return loss.mean() * weight
 
+    # Handle variable length sequences with masking
     loss = loss[mask].sum() / mask.sum().clamp(min = 1e-5)
     return loss * weight
 
-# init helpers
+# Initialization helpers
 
 def init_zero_(layer):
+    """
+    Initialize layer weights and biases to zero.
+
+    Often used for output projections to start with identity-like behavior.
+
+    Args:
+        layer: PyTorch layer to initialize
+    """
     nn.init.constant_(layer.weight, 0.)
     if exists(layer.bias):
         nn.init.constant_(layer.bias, 0.)
 
-# keyword argument helpers
+# Keyword argument helpers for flexible configuration
 
 def pick_and_pop(keys, d):
+    """
+    Extract and remove specified keys from dictionary.
+
+    Args:
+        keys: Keys to extract
+        d: Dictionary to modify
+
+    Returns:
+        New dictionary with extracted key-value pairs
+    """
     values = tuple(d.pop(key) for key in  keys)
     return dict(zip(keys, values))
 
 def group_dict_by_key(cond, d):
+    """
+    Split dictionary into two based on condition function.
+
+    Args:
+        cond: Condition function applied to keys
+        d: Dictionary to split
+
+    Returns:
+        Tuple of (matching_dict, non_matching_dict)
+    """
     return_val = [dict(),dict()]
     for key in d.keys():
         match = bool(cond(key))
@@ -245,27 +503,68 @@ def group_dict_by_key(cond, d):
     return tuple(return_val)
 
 def string_begins_with(prefix, str):
+    """Check if string begins with given prefix."""
     return str.startswith(prefix)
 
 def group_by_key_prefix(prefix, d):
+    """
+    Split dictionary by key prefix.
+
+    Args:
+        prefix: Prefix to match
+        d: Dictionary to split
+
+    Returns:
+        Tuple of (keys_with_prefix, keys_without_prefix)
+    """
     return group_dict_by_key(partial(string_begins_with, prefix), d)
 
 def groupby_prefix_and_trim(prefix, d):
+    """
+    Split dictionary by prefix and remove prefix from matching keys.
+
+    Useful for extracting module-specific kwargs (e.g., 'attn_*' -> '*').
+
+    Args:
+        prefix: Prefix to match and trim
+        d: Dictionary to process
+
+    Returns:
+        Tuple of (trimmed_matching_dict, non_matching_dict)
+    """
     kwargs_with_prefix, kwargs = group_dict_by_key(partial(string_begins_with, prefix), d)
     prefix_len = len(prefix)
     kwargs_without_prefix = {key[prefix_len:]: value for key, value in kwargs_with_prefix.items()}
     return kwargs_without_prefix, kwargs
 
-# structured dropout, more effective than traditional attention dropouts
+# Structured dropout - more effective than traditional attention dropouts
 
 def dropout_seq(seq, mask, dropout):
+    """
+    Apply structured dropout to sequences.
+
+    Instead of dropping individual elements, this drops entire tokens randomly,
+    which is more effective for sequences than traditional dropout.
+    Used for cross-attention token dropout.
+
+    Args:
+        seq: Input sequence (b, n, d)
+        mask: Boolean mask for valid positions
+        dropout: Dropout probability (fraction of tokens to drop)
+
+    Returns:
+        Tuple of (dropped_seq, updated_mask)
+    """
     b, n, *_, device = *seq.shape, seq.device
+    # Generate random logits for each position
     logits = torch.randn(b, n, device = device)
 
     if exists(mask):
         mask_value = max_neg_value(logits)
+        # Mask out invalid positions so they won't be selected
         logits = logits.masked_fill(~mask, mask_value)
 
+    # Keep top-k positions based on random logits
     keep_prob = 1. - dropout
     num_keep = max(1,  int(keep_prob * n))
     keep_indices = logits.topk(num_keep, dim = 1).indices
@@ -273,9 +572,11 @@ def dropout_seq(seq, mask, dropout):
     batch_indices = arange(b, device = device)
     batch_indices = rearrange(batch_indices, 'b -> b 1')
 
+    # Select kept tokens
     seq = seq[batch_indices, keep_indices]
 
     if exists(mask):
+        # Update mask to reflect actual kept tokens
         seq_counts = mask.sum(dim = -1)
         seq_keep_counts = torch.ceil(seq_counts * keep_prob).int()
         keep_mask = arange(num_keep, device = device) < rearrange(seq_keep_counts, 'b -> b 1')
@@ -284,42 +585,89 @@ def dropout_seq(seq, mask, dropout):
 
     return seq, mask
 
-# activations
+# Activation functions
 
 class ReluSquared(Module):
+    """
+    ReLU squared activation function.
+
+    Applies ReLU then squares the result: f(x) = (max(0, x))^2
+    This provides a smooth, differentiable alternative to ReLU with stronger activation.
+    """
     def forward(self, x):
         return F.relu(x) ** 2
 
 class SoLU(Module):
+    """
+    Softmax Linear Unit (SoLU) activation.
+
+    Proposed by Anthropic, combines softmax gating with layer normalization.
+    f(x) = softmax(x) * x, then normalized.
+
+    Args:
+        dim: Feature dimension for layer normalization
+    """
     def __init__(self, dim):
         super().__init__()
         self.norm = LayerNorm(dim)
 
     def forward(self, x):
+        # Softmax gating: each feature is weighted by its softmax probability
         activated = x.softmax(dim = -1) * x
         return self.norm(activated)
 
-# embedding
+# Token embedding classes
 
 class TokenEmbedding(Module):
+    """
+    Standard token embedding with optional L2 normalization.
+
+    Args:
+        dim: Embedding dimension
+        num_tokens: Vocabulary size
+        l2norm_embed: If True, normalize embeddings to unit length
+    """
     def __init__(self, dim, num_tokens, l2norm_embed = False):
         super().__init__()
         self.l2norm_embed = l2norm_embed
         self.emb = nn.Embedding(num_tokens, dim)
 
     def forward(self, x):
+        """
+        Args:
+            x: Token indices (any shape)
+
+        Returns:
+            Embeddings of shape (*x.shape, dim)
+        """
         token_emb = self.emb(x.long())
         return l2norm(token_emb) if self.l2norm_embed else token_emb
 
     def init_(self):
+        """
+        Initialize embeddings.
+
+        Uses small normal init for l2norm embeddings, Kaiming normal otherwise.
+        """
         if self.l2norm_embed:
             nn.init.normal_(self.emb.weight, std=1e-5)
             return
         nn.init.kaiming_normal_(self.emb.weight)
 
-# positional embeddings
+# Positional embedding classes - various methods to encode position information
 
 class AbsolutePositionalEmbedding(Module):
+    """
+    Learnable absolute positional embeddings.
+
+    Standard approach from original Transformer paper - each position has a
+    learnable embedding that's added to token embeddings.
+
+    Args:
+        dim: Embedding dimension
+        max_seq_len: Maximum sequence length supported
+        l2norm_embed: If True, normalize embeddings to unit length
+    """
     def __init__(self, dim, max_seq_len, l2norm_embed = False):
         super().__init__()
         self.scale = dim ** -0.5 if not l2norm_embed else 1.
@@ -334,12 +682,23 @@ class AbsolutePositionalEmbedding(Module):
         seq_start_pos = None,
         offset = 0
     ):
+        """
+        Args:
+            x: Input tensor (b, n, d)
+            pos: Optional explicit positions
+            seq_start_pos: Starting position for each sequence (for left-padding)
+            offset: Position offset
+
+        Returns:
+            Positional embeddings (b, n, d) or (n, d)
+        """
         seq_len, device = x.shape[1], x.device
         assert seq_len <= self.max_seq_len, f'you are passing in a sequence length of {seq_len} but your absolute positional embedding has a max sequence length of {self.max_seq_len}'
 
         if not exists(pos):
             pos = arange(seq_len, device = device) + offset
 
+        # Handle left-padded sequences
         if exists(seq_start_pos):
             pos = (pos - seq_start_pos[..., None]).clamp(min = 0)
 
@@ -348,11 +707,22 @@ class AbsolutePositionalEmbedding(Module):
         return l2norm(pos_emb) if self.l2norm_embed else pos_emb
 
 class ScaledSinusoidalEmbedding(Module):
+    """
+    Scaled sinusoidal positional embeddings.
+
+    Modification of original Transformer sinusoidal embeddings with learnable scaling.
+    Unlike absolute positional embeddings, these can extrapolate to longer sequences.
+
+    Args:
+        dim: Embedding dimension (must be even)
+        theta: Base for frequency computation (default 10000)
+    """
     def __init__(self, dim, theta = 10000):
         super().__init__()
         assert divisible_by(dim, 2)
         self.scale = nn.Parameter(torch.ones(1) * dim ** -0.5)
 
+        # Compute inverse frequencies
         half_dim = dim // 2
         freq_seq = arange(half_dim).float() / half_dim
         inv_freq = theta ** -freq_seq
@@ -365,6 +735,16 @@ class ScaledSinusoidalEmbedding(Module):
         seq_start_pos = None,
         offset = 0
     ):
+        """
+        Args:
+            x: Input tensor (b, n, d)
+            pos: Optional explicit positions
+            seq_start_pos: Starting position for each sequence
+            offset: Position offset
+
+        Returns:
+            Sinusoidal positional embeddings
+        """
         seq_len, device = x.shape[1], x.device
 
         if not exists(pos):
@@ -373,11 +753,26 @@ class ScaledSinusoidalEmbedding(Module):
         if exists(seq_start_pos):
             pos = pos - seq_start_pos[..., None]
 
+        # Create sine and cosine embeddings at different frequencies
         emb = einsum('i, j -> i j', pos, self.inv_freq)
         emb = cat((emb.sin(), emb.cos()), dim = -1)
         return emb * self.scale
 
 class RelativePositionBias(Module):
+    """
+    T5-style relative positional bias.
+
+    Instead of adding positional embeddings to tokens, this adds learned biases
+    to attention logits based on relative distances. Positions are bucketed
+    (nearby positions use exact buckets, distant ones use logarithmic buckets).
+
+    Args:
+        scale: Scale factor for the bias
+        causal: If True, use causal (unidirectional) bias
+        num_buckets: Number of relative position buckets
+        max_distance: Maximum distance to consider
+        heads: Number of attention heads
+    """
     def __init__(self, scale, causal = False, num_buckets = 32, max_distance = 128, heads = 8):
         super().__init__()
         self.scale = scale
@@ -388,18 +783,37 @@ class RelativePositionBias(Module):
 
     @staticmethod
     def _relative_position_bucket(relative_position, causal = True, num_buckets = 32, max_distance = 128):
+        """
+        Translate relative positions to bucket indices.
+
+        Uses exact bucketing for small distances and logarithmic bucketing
+        for larger distances to efficiently represent long-range dependencies.
+
+        Args:
+            relative_position: Relative position matrix
+            causal: Whether to use causal bucketing
+            num_buckets: Total number of buckets
+            max_distance: Maximum distance considered
+
+        Returns:
+            Bucket indices for each relative position
+        """
         ret = 0
         n = -relative_position
         if not causal:
+            # Bidirectional: split buckets between positive and negative
             num_buckets //= 2
             ret += (n < 0).long() * num_buckets
             n = torch.abs(n)
         else:
+            # Causal: all positions are backward-looking
             n = torch.max(n, torch.zeros_like(n))
 
+        # Half of buckets for exact positions, half for logarithmic
         max_exact = num_buckets // 2
         is_small = n < max_exact
 
+        # Logarithmic bucketing for larger distances
         val_if_large = max_exact + (
             torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
         ).long()
@@ -413,9 +827,18 @@ class RelativePositionBias(Module):
         return next(self.parameters()).device
 
     def forward(self, i, j):
+        """
+        Args:
+            i: Query sequence length
+            j: Key sequence length
+
+        Returns:
+            Relative position bias of shape (heads, i, j)
+        """
         device = self.device
         q_pos = arange(j - i, j, dtype = torch.long, device = device)
         k_pos = arange(j, dtype = torch.long, device = device)
+        # Compute all pairwise relative positions
         rel_pos = einx.subtract('j, i -> i j', k_pos, q_pos)
         rp_bucket = self._relative_position_bucket(rel_pos, causal = self.causal, num_buckets = self.num_buckets, max_distance = self.max_distance)
         values = self.relative_attention_bias(rp_bucket)
@@ -424,7 +847,21 @@ class RelativePositionBias(Module):
 
 class CoPE(Module):
     """
-    Appendix B of https://arxiv.org/abs/2405.18719
+    Contextual Position Encoding (CoPE).
+
+    From "Contextual Position Encoding: Learning to Count What's Important"
+    https://arxiv.org/abs/2405.18719
+
+    CoPE computes positions based on attention patterns, allowing the model to
+    count contextually relevant tokens rather than absolute positions.
+
+    Args:
+        dim: Dimension per attention head
+        heads: Number of attention heads
+        max_pos: Maximum position value
+        soft_onehot: If True, use soft one-hot encoding for positions
+        talking_heads: If True, use talking heads (inter-head communication)
+        soft_onehot_temp: Temperature for soft one-hot
     """
     def __init__ (
         self,
@@ -449,7 +886,14 @@ class CoPE(Module):
         self.register_buffer('positions', arange(max_pos))
 
     def forward(self, query, attn_logits):
+        """
+        Args:
+            query: Query tensor (b, h, n, d)
+            attn_logits: Attention logits before softmax
 
+        Returns:
+            Position embeddings based on contextual position
+        """
         if exists(self.talking_heads):
             i, j = attn_logits.shape[-2:]
             causal_mask = attn_logits.new_ones(i, j).triu_(j - i + 1).bool()
@@ -458,21 +902,23 @@ class CoPE(Module):
 
             attn_logits = attn_logits.masked_fill(causal_mask, -torch.finfo(attn_logits.dtype).max)
 
-        # compute positions
-
+        # Compute contextual positions using cumulative gating
         gates = attn_logits.sigmoid()
 
+        # Count backward from each position
         pos = gates.flip(-1).cumsum(dim = -1).flip(-1)
         pos = pos.clamp(max = self.max_pos - 1)
 
+        # Project queries to position logits
         logits_int = einsum('b h n d, p d -> b h n p', query, self.pos_emb)
 
         if self.soft_onehot:
+            # Soft interpolation
             diff_pos = einx.subtract('i, j -> i j', pos, self.positions).abs()
             soft_onehot_pos = F.softmax(-diff_pos / self.soft_onehot_temp, dim = -1)
             cope_pos_emb = einsum('b h i j p, b h i p -> b h i j', soft_onehot_pos, logits_int)
         else:
-            # interpolate from integer positions
+            # Linear interpolation between integer positions
             pos_ceil = pos.ceil().long()
             pos_floor = pos.floor().long()
             logits_ceil = logits_int.gather(-1, pos_ceil)
@@ -696,6 +1142,23 @@ class PerRowDataDependentAlibi(Module):
         return forget_gates
 
 class RotaryEmbedding(Module):
+    """
+    Rotary Position Embedding (RoPE).
+
+    From "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+    https://arxiv.org/abs/2104.09864
+
+    Encodes position information by rotating query/key vectors in a way that
+    naturally captures relative positions through inner products.
+
+    Args:
+        dim: Dimension to apply rotation to (typically dim_head or portion of it)
+        use_xpos: If True, use xPos scaling for length extrapolation
+        scale_base: Base for xPos scaling
+        interpolation_factor: Factor to interpolate frequencies (for longer sequences)
+        base: Base for frequency computation
+        base_rescale_factor: NTK-aware rescaling factor for better extrapolation
+    """
     def __init__(
         self,
         dim,
@@ -706,11 +1169,12 @@ class RotaryEmbedding(Module):
         base_rescale_factor = 1.
     ):
         super().__init__()
-        # proposed by reddit user bloc97, to rescale rotary embeddings to longer sequence length without fine-tuning
-        # has some connection to NTK literature
+        # NTK-aware scaling proposed by reddit user bloc97
+        # Allows better extrapolation to longer sequences without fine-tuning
         # https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_rope_allows_llama_models_to_have/
         base *= base_rescale_factor ** (dim / (dim - 2))
 
+        # Compute inverse frequencies for different dimensions
         inv_freq = 1. / (base ** (arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
 
@@ -721,12 +1185,14 @@ class RotaryEmbedding(Module):
             self.register_buffer('scale', None)
             return
 
+        # xPos: length extrapolation through exponential decay
         scale = (arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim)
 
         self.scale_base = scale_base
         self.register_buffer('scale', scale)
 
     def forward_from_seq_len(self, seq_len):
+        """Convenience method to generate embeddings from sequence length."""
         device = self.inv_freq.device
 
         t = arange(seq_len, device = device)
@@ -734,18 +1200,29 @@ class RotaryEmbedding(Module):
 
     @autocast('cuda', enabled = False)
     def forward(self, t, offset = 0):
+        """
+        Args:
+            t: Position indices
+            offset: Position offset (not currently used)
+
+        Returns:
+            Tuple of (frequencies, scales) for rotary embedding
+        """
         max_pos = t.max() + 1
 
         if t.ndim == 1:
             t = rearrange(t, 'n -> 1 n')
 
+        # Compute frequency features
         freqs = torch.einsum('b i , j -> b i j', t.type_as(self.inv_freq), self.inv_freq) / self.interpolation_factor
+        # Duplicate for complex rotation (cos, sin pairs)
         freqs = stack((freqs, freqs), dim = -1)
         freqs = rearrange(freqs, '... d r -> ... (d r)')
 
         if not exists(self.scale):
             return freqs, 1.
 
+        # Compute xPos scaling
         power = (t - (max_pos // 2)) / self.scale_base
         scale = self.scale ** rearrange(power, '... n -> ... n 1')
         scale = stack((scale, scale), dim = -1)
@@ -754,6 +1231,17 @@ class RotaryEmbedding(Module):
         return freqs, scale
 
 def rotate_half(x):
+    """
+    Helper function for rotary embeddings.
+
+    Rotates pairs of dimensions: [x1, x2, x3, x4] -> [-x2, x1, -x4, x3]
+
+    Args:
+        x: Input tensor
+
+    Returns:
+        Rotated tensor
+    """
     x = rearrange(x, '... (d r) -> ... d r', r = 2)
     x1, x2 = x.unbind(dim = -1)
     x = stack((-x2, x1), dim = -1)
@@ -761,27 +1249,53 @@ def rotate_half(x):
 
 @autocast('cuda', enabled = False)
 def apply_rotary_pos_emb(t, freqs, scale = 1):
+    """
+    Apply rotary position embeddings to tensor.
+
+    The rotation is applied by:
+    1. Splitting tensor into pairs of dimensions
+    2. Rotating each pair by position-dependent angle
+    3. Scaling by xPos factor if provided
+
+    Args:
+        t: Input tensor to rotate (typically query or key)
+        freqs: Frequency embeddings from RotaryEmbedding
+        scale: Scaling factor (1 for no scaling, or xPos scales)
+
+    Returns:
+        Tensor with rotary position embeddings applied
+    """
     rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
 
+    # Get frequencies for current sequence
     freqs = freqs[:, -seq_len:, :]
     scale = scale[:, -seq_len:, :] if is_tensor(scale) else scale
 
+    # Handle 4D tensors (with heads dimension)
     if t.ndim == 4 and freqs.ndim == 3:
         freqs = rearrange(freqs, 'b n d -> b 1 n d')
 
         if is_tensor(scale):
             scale = rearrange(scale, 'b n d -> b 1 n d')
 
-    # partial rotary embeddings, Wang et al. GPT-J
+    # Partial rotary embeddings (Wang et al. GPT-J)
+    # Only rotate first rot_dim dimensions, leave rest unchanged
     t, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
     t = (t * freqs.cos() * scale) + (rotate_half(t) * freqs.sin() * scale)
     out = cat((t, t_unrotated), dim = -1)
 
     return out.type(orig_dtype)
 
-# norms
+# Normalization layers
 
 class Scale(Module):
+    """
+    Wrapper to scale the output of a module.
+
+    Args:
+        value: Scale factor
+        fn: Module to wrap
+    """
     def __init__(self, value, fn):
         super().__init__()
         self.value = value
@@ -794,25 +1308,43 @@ class Scale(Module):
         if not isinstance(out, tuple):
             return scale_fn(out)
 
+        # If output is tuple, only scale first element
         return (scale_fn(out[0]), *out[1:])
 
 class LayerNorm(Module):
+    """
+    Layer Normalization without bias.
+
+    Bias-less layernorm has been shown to be more stable. Most newer models
+    have moved towards RMSNorm, which is also bias-less.
+
+    Args:
+        dim: Feature dimension
+        unit_offset: If True, initialize gamma with unit offset for better
+                     compatibility with weight decay
+    """
     def __init__(
         self,
         dim,
         unit_offset = False
     ):
-        """
-        bias-less layernorm has been shown to be more stable. most newer models have moved towards rmsnorm, also bias-less
-        """
         super().__init__()
         self.unit_offset = unit_offset
 
+        # Use LayerNorm without learnable affine parameters
         self.ln = nn.LayerNorm(dim, elementwise_affine = False)
         self.gamma = nn.Parameter(torch.ones(dim))
+        # Initialize gamma accounting for unit offset
         nn.init.constant_(self.gamma, 1. - float(unit_offset))
 
     def forward(self, x):
+        """
+        Args:
+            x: Input tensor (..., dim)
+
+        Returns:
+            Normalized tensor
+        """
         normed = self.ln(x)
         gamma = self.gamma + float(self.unit_offset)
         return normed * gamma
@@ -1234,9 +1766,21 @@ class ConcatCombine(Module):
         concatted_skip = cat((skip, x), dim = -1)
         return self.combine(concatted_skip)
 
-# feedforward
+# Feedforward networks
 
 class GLU(Module):
+    """
+    Gated Linear Unit (GLU) variant.
+
+    Splits projection into two parts: values and gates. The output is
+    values * activation(gates).
+
+    Args:
+        dim_in: Input dimension
+        dim_out: Output dimension
+        activation: Activation function for gates
+        mult_bias: If True, add learnable multiplicative bias
+    """
     def __init__(
         self,
         dim_in,
@@ -1246,14 +1790,47 @@ class GLU(Module):
     ):
         super().__init__()
         self.act = activation
+        # Project to 2x output (for values and gates)
         self.proj = nn.Linear(dim_in, dim_out * 2)
         self.mult_bias = nn.Parameter(torch.ones(dim_out)) if mult_bias else 1.
 
     def forward(self, x):
+        """
+        Args:
+            x: Input tensor
+
+        Returns:
+            Gated output: values * activation(gates) * mult_bias
+        """
         x, gate = self.proj(x).chunk(2, dim = -1)
         return x * self.act(gate) * self.mult_bias
 
 class FeedForward(Module):
+    """
+    Standard feedforward network with various activation options.
+
+    Implements the FFN from "Attention is All You Need" with many extensions:
+    - Various activations (GELU, SiLU, ReLU², SoLU)
+    - GLU variants (Gated Linear Units)
+    - Optional post-activation normalization
+    - Configurable dropout
+
+    Args:
+        dim: Input/output dimension
+        dim_out: Output dimension (if different from input)
+        mult: Multiplier for hidden dimension (default 4x)
+        glu: If True, use GLU activation
+        glu_mult_bias: If True, add learnable bias to GLU
+        swish: If True, use SiLU/Swish activation
+        relu_squared: If True, use squared ReLU
+        solu: If True, use SoLU activation
+        custom_activation: Custom activation module
+        post_act_ln: If True, add LayerNorm after activation
+        dropout: Dropout rate for hidden layer
+        sublayer_dropout: Dropout rate for output
+        no_bias: If True, use linear layers without bias
+        zero_init_output: If True, initialize output projection to zero
+    """
     def __init__(
         self,
         dim,
@@ -1277,6 +1854,7 @@ class FeedForward(Module):
 
         assert at_most_one_of(relu_squared, solu)
 
+        # Choose activation function
         if exists(custom_activation):
             activation = deepcopy(custom_activation)
         elif relu_squared:
@@ -1288,6 +1866,7 @@ class FeedForward(Module):
         else:
             activation = nn.GELU()
 
+        # Build input projection (with or without GLU)
         if glu:
             proj_in = GLU(dim, inner_dim, activation, mult_bias = glu_mult_bias)
         else:
@@ -1298,6 +1877,7 @@ class FeedForward(Module):
 
         proj_out = nn.Linear(inner_dim, dim_out, bias = not no_bias)
 
+        # Complete feedforward network
         self.ff = Sequential(
             proj_in,
             LayerNorm(inner_dim) if post_act_ln else None,
@@ -1306,12 +1886,17 @@ class FeedForward(Module):
             nn.Dropout(sublayer_dropout) if sublayer_dropout > 0. else None
         )
 
-        # init last linear layer to 0
-
+        # Initialize output projection to zero for better training dynamics
         if zero_init_output:
             init_zero_(proj_out)
 
     def muon_parameters(self):
+        """
+        Extract parameters for Muon optimizer.
+
+        Returns:
+            List of weight parameters for Muon optimizer
+        """
         weights = []
 
         for m in self.modules():
@@ -1327,16 +1912,49 @@ class FeedForward(Module):
         x,
         deep_embed = None
     ):
+        """
+        Args:
+            x: Input tensor (b, n, d)
+            deep_embed: Optional deep embeddings to multiply output with
+
+        Returns:
+            Output tensor (b, n, dim_out)
+        """
         out = self.ff(x)
 
+        # Apply deep embeddings if provided (for value embeddings)
         if exists(deep_embed):
             out = out * deep_embed
 
         return out
 
-# attention. it is all we need
+# Attention mechanism - "it is all we need"
 
 class Attention(Module):
+    """
+    Multi-head attention with extensive customization options.
+
+    This is a highly flexible attention implementation supporting:
+    - Standard, causal, and cross attention
+    - Flash attention for efficiency
+    - Grouped query attention (GQA) and multi-query attention (MQA)
+    - Various positional encodings (RoPE, ALiBi, T5 bias, CoPE)
+    - QK normalization for stability
+    - Sparse attention (top-k)
+    - Talking heads
+    - Value gating
+    - Multi-latent attention (MLA)
+    - Hybrid modules (e.g., Mamba-like SSMs)
+    - And many more features...
+
+    Args:
+        dim: Model dimension
+        dim_head: Dimension per attention head
+        dim_context: Context dimension (for cross-attention)
+        heads: Number of attention heads
+        causal: If True, use causal (unidirectional) attention
+        flash: If True, use flash attention
+    """
     def __init__(
         self,
         dim,
@@ -2112,6 +2730,30 @@ class Attention(Module):
         return out, intermediates
 
 class AttentionLayers(Module):
+    """
+    Core transformer architecture with flexible layer configuration.
+
+    This class stacks attention and feedforward layers with extensive customization:
+    - Configurable layer types and execution order
+    - Pre-norm or post-norm architecture
+    - Various normalization types (LayerNorm, RMSNorm, etc.)
+    - Residual connections with optional gating or scaling
+    - Cross-attention for encoder-decoder models
+    - Relative and absolute positional encodings
+    - Memory/recurrence support
+    - U-Net style skip connections
+    - Layer integration (LIMe)
+    - Hyper-connections (multiple residual streams)
+    - And many more advanced features...
+
+    Args:
+        dim: Model dimension
+        depth: Number of layers (can be None if using custom_layers)
+        heads: Number of attention heads
+        causal: If True, use causal attention
+        cross_attend: If True, add cross-attention layers
+        only_cross: If True, use only cross-attention (no self-attention)
+    """
     def __init__(
         self,
         dim,
@@ -2945,16 +3587,38 @@ class AttentionLayers(Module):
         return x, intermediates
 
 class Encoder(AttentionLayers):
+    """
+    Encoder architecture (bidirectional attention).
+
+    Convenience class that sets causal=False for bidirectional attention.
+    Used for tasks like BERT-style masked language modeling or encoding
+    input sequences in encoder-decoder models.
+    """
     def __init__(self, **kwargs):
         assert 'causal' not in kwargs, 'cannot set causality on encoder'
         super().__init__(causal = False, **kwargs)
 
 class Decoder(AttentionLayers):
+    """
+    Decoder architecture (unidirectional/causal attention).
+
+    Convenience class that sets causal=True for autoregressive generation.
+    Used for tasks like GPT-style language modeling or decoding in
+    encoder-decoder models.
+    """
     def __init__(self, **kwargs):
         assert 'causal' not in kwargs, 'cannot set causality on decoder'
         super().__init__(causal = True, **kwargs)
 
 class PrefixDecoder(AttentionLayers):
+    """
+    Prefix decoder architecture (bidirectional attention with causal masking).
+
+    Used for tasks where there's a bidirectional prefix (e.g., prompt)
+    followed by causal generation. The attention mask is constructed
+    dynamically to allow bidirectional attention on the prefix and
+    causal attention on the generated portion.
+    """
     def __init__(self, **kwargs):
         assert 'causal' not in kwargs, 'cannot set causality on decoder'
         super().__init__(causal = False, **kwargs)
@@ -2985,10 +3649,38 @@ class PrefixDecoder(AttentionLayers):
         return super().forward(x, *args, attn_mask = forwarded_mask, **kwargs)
 
 class CrossAttender(AttentionLayers):
+    """
+    Cross-attention only architecture.
+
+    Used for tasks where you only need cross-attention (no self-attention).
+    Useful for attending to a context/memory while processing queries.
+
+    Example use case: Perceiver architecture where latent queries attend to inputs.
+    """
     def __init__(self, **kwargs):
         super().__init__(cross_attend = True, only_cross = True, **kwargs)
 
 class AttentionPool(Module):
+    """
+    Attention-based pooling mechanism.
+
+    Uses learnable query tokens to pool information from a sequence via
+    cross-attention. More flexible than simple mean/max pooling.
+
+    Common in vision transformers and for sequence classification tasks.
+
+    Args:
+        dim: Query dimension
+        num_pooled_tokens: Number of learnable pooling queries
+        dim_context: Context dimension (defaults to dim)
+        add_residual: If True, add residual connection
+        depth: Number of cross-attention layers
+        heads: Number of attention heads
+        dim_head: Dimension per attention head
+        use_transformer_blocks: If True, use full transformer blocks
+        squeeze_output: If True and num_pooled_tokens=1, remove sequence dim
+        attn_kwargs: Additional kwargs for attention layers
+    """
     def __init__(
         self,
         dim,
@@ -3040,6 +3732,36 @@ class AttentionPool(Module):
         return pooled
 
 class ViTransformerWrapper(Module):
+    """
+    Vision Transformer (ViT) wrapper.
+
+    Wraps an Encoder with image-specific components:
+    - Patch embedding (split image into patches)
+    - Learnable positional embeddings
+    - Optional register tokens (from Vision Transformers Need Registers)
+    - Classification head
+
+    Based on "An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale"
+    https://arxiv.org/abs/2010.11929
+
+    Args:
+        image_size: Input image size (assumes square images)
+        patch_size: Size of each patch
+        attn_layers: Encoder module for transformer layers
+        channels: Number of input channels (3 for RGB)
+        num_classes: Number of classes for classification (None for embeddings only)
+        post_emb_norm: If True, normalize after embedding
+        num_register_tokens: Number of register tokens (from https://arxiv.org/abs/2309.16588)
+        emb_dropout: Dropout rate for embeddings
+
+    Usage:
+        vit = ViTransformerWrapper(
+            image_size=224,
+            patch_size=16,
+            attn_layers=Encoder(dim=512, depth=12, heads=8),
+            num_classes=1000
+        )
+    """
     def __init__(
         self,
         *,
@@ -3121,6 +3843,28 @@ class ViTransformerWrapper(Module):
         return logits, embed
 
 class TransformerWrapper(Module):
+    """
+    Complete transformer model with embeddings and output projection.
+
+    Wraps AttentionLayers with:
+    - Token embeddings
+    - Positional embeddings (absolute, sinusoidal, or rotary)
+    - Optional additional embeddings (e.g., segment embeddings)
+    - Output projection to logits
+    - Memory/caching support for efficient generation
+    - Optional attention pooling or CLS tokens
+    - Optional recycling (AlphaFold2 style)
+    - Optional deep embeddings for feedforward layers
+    - Mixture of softmax for output
+    - And more...
+
+    Args:
+        num_tokens: Vocabulary size
+        max_seq_len: Maximum sequence length
+        attn_layers: Underlying AttentionLayers module (Encoder or Decoder)
+        embed_num_tokens: Dict of additional embedding types (e.g., segment embeddings)
+        emb_dim: Embedding dimension (defaults to model dim)
+    """
     def __init__(
         self,
         *,
@@ -3678,6 +4422,44 @@ class TransformerWrapper(Module):
         return out
 
 class XTransformer(Module):
+    """
+    Complete encoder-decoder transformer architecture.
+
+    Combines an encoder and decoder into a full sequence-to-sequence model.
+    Useful for tasks like:
+    - Machine translation
+    - Summarization
+    - Question answering
+    - Any other seq2seq task
+
+    The encoder processes the source sequence bidirectionally, and the decoder
+    generates the target sequence autoregressively while cross-attending to
+    the encoder output.
+
+    Args:
+        dim: Model dimension (shared by encoder and decoder)
+        tie_token_emb: If True, tie encoder and decoder token embeddings
+        ignore_index: Index to ignore in loss computation
+        pad_value: Padding token value
+        cross_attn_tokens_dropout: Dropout rate for encoder tokens during cross-attention
+        **kwargs: Additional arguments prefixed with 'enc_' or 'dec_' for encoder/decoder
+
+    Usage:
+        model = XTransformer(
+            dim=512,
+            enc_num_tokens=10000,
+            enc_depth=6,
+            enc_heads=8,
+            enc_max_seq_len=1024,
+            dec_num_tokens=10000,
+            dec_depth=6,
+            dec_heads=8,
+            dec_max_seq_len=1024
+        )
+
+        loss = model(src, tgt)  # Training
+        output = model.generate(src, tgt_start, seq_len)  # Generation
+    """
     def __init__(
         self,
         *,
@@ -3689,6 +4471,7 @@ class XTransformer(Module):
         **kwargs
     ):
         super().__init__()
+        # Split kwargs by prefix
         enc_kwargs, kwargs = groupby_prefix_and_trim('enc_', kwargs)
         dec_kwargs, kwargs = groupby_prefix_and_trim('dec_', kwargs)
 
