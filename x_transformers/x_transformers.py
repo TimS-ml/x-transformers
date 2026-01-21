@@ -930,6 +930,29 @@ class CoPE(Module):
         return cope_pos_emb
 
 class DynamicPositionBias(Module):
+    """
+    Dynamic Position Bias using learned MLP
+    Related papers:
+    - "Rethinking Positional Encoding in Language Pre-training" https://arxiv.org/abs/2006.15595
+    - T5's relative position bias: https://arxiv.org/abs/1910.10683
+
+    Instead of using fixed or simple learned biases, this approach uses a multi-layer
+    perceptron (MLP) to compute attention biases from relative positions. The MLP learns
+    a continuous function that maps relative distances to attention bias values.
+
+    The key advantages:
+    1. Can generalize to sequence lengths not seen during training
+    2. Learns complex, non-linear position-dependent attention patterns
+    3. Each attention head receives position-specific bias values
+
+    Args:
+        dim: Hidden dimension of the MLP
+        heads: Number of attention heads (output dimension)
+        depth: Number of layers in the MLP (must be ≥ 1)
+        log_distance: If True, apply log transformation to distances before MLP,
+                     which can help with long-range dependencies (default: False)
+        norm: If True, apply LayerNorm after each linear layer (default: False)
+    """
     def __init__(self, dim, *, heads, depth, log_distance = False, norm = False):
         super().__init__()
         assert depth >= 1, 'depth for dynamic position bias MLP must be greater or equal to 1'
@@ -1052,7 +1075,30 @@ class AlibiPositionalBias(Module):
         return self.bias
 
 class DataDependentAlibi(Module):
-    """ https://openreview.net/forum?id=q2Lnyegkr8 """
+    """
+    Data-Dependent ALiBi (Attention with Linear Biases)
+    Paper: https://openreview.net/forum?id=q2Lnyegkr8
+
+    An extension of ALiBi (https://arxiv.org/abs/2108.12409) where the attention bias
+    is computed dynamically based on the input data, rather than using fixed slopes.
+
+    Instead of fixed linear biases, this variant:
+    1. Computes "forget gates" from input tokens via a learned linear layer
+    2. Uses cumulative sum of log-sigmoid forget gates as position-dependent biases
+    3. Allows the model to learn which positions to attend to based on content
+
+    This makes the positional bias content-aware, enabling the model to dynamically
+    adjust attention patterns based on the actual input sequence rather than just
+    using fixed distance-based penalties.
+
+    Args:
+        dim: Input feature dimension
+        heads: Number of attention heads
+        causal: If True, use causal (unidirectional) attention; if False, bidirectional
+                (default: True)
+        bias_init: Initial bias value for the linear layer (default: 5.0)
+        post_log_scale: Scaling factor applied after log-sigmoid (default: 1.0)
+    """
 
     def __init__(
         self,
@@ -1096,7 +1142,32 @@ class DataDependentAlibi(Module):
         return forget_gates
 
 class PerRowDataDependentAlibi(Module):
-    """ same as data dependent alibi from forgetting transformer, but the forgetting gates are also derived by a queries and keys with a small head dimension """
+    """
+    Per-Row Data-Dependent ALiBi
+    Related to: "Forgetting Transformer" paper's data-dependent bias mechanism
+
+    An advanced variant of DataDependentAlibi where forget gates are computed per
+    query-key pair rather than just from input tokens. This provides finer-grained
+    control over attention patterns.
+
+    Unlike DataDependentAlibi which computes forget gates from input alone, this variant:
+    1. Projects inputs to small query and key representations (dim_head dimensions)
+    2. Computes forget gates from query-key interactions (like attention scores)
+    3. Applies these per-position-pair forget gates as attention biases
+
+    This allows each query position to have different forgetting behavior based on
+    its relationship with each key position, providing more expressive positional
+    modeling than fixed or input-only data-dependent biases.
+
+    Args:
+        dim: Input feature dimension
+        heads: Number of attention heads
+        causal: If True, use causal attention (only supports causal for now)
+                (default: True)
+        dim_head: Dimension for small query/key projections used to compute forget
+                  gates (default: 8)
+        post_log_scale: Scaling factor applied after log-sigmoid (default: 1.0)
+    """
 
     def __init__(
         self,
@@ -1286,6 +1357,97 @@ def apply_rotary_pos_emb(t, freqs, scale = 1):
 
     return out.type(orig_dtype)
 
+class PolarEmbedding(Module):
+    """
+    Polar Position Embedding (PoPE)
+    Paper: "Polar Positional Encoding for Length Extrapolation" https://arxiv.org/abs/2509.10534
+    Authors: Gopalakrishnan et al.
+
+    PoPE is a novel positional encoding scheme designed for better length extrapolation in
+    transformers. Instead of using standard sine/cosine embeddings, PoPE uses polar coordinates
+    where position information is encoded as:
+    - Magnitude: learned and can be adjusted per-head via learned bias
+    - Phase: based on position using inverse frequencies (similar to RoPE)
+
+    The key innovation is using polar coordinates (r, θ) instead of Cartesian (x, y),
+    which provides better inductive bias for capturing relative positions and enables
+    models to extrapolate to longer sequences than seen during training.
+
+    Each attention head can learn its own bias term (phase shift in [-2π, 0]) to
+    customize the positional encoding behavior, allowing different heads to focus on
+    different positional relationships.
+
+    Args:
+        dim: Dimension of the positional encoding (usually head_dim)
+        heads: Number of attention heads (for per-head learned bias)
+        bias_uniform_init: If True, initialize learned bias uniformly in [-2π, 0]
+                          instead of zeros (default: False)
+        base: Base for computing inverse frequencies, similar to RoPE (default: 10000)
+    """
+
+    def __init__(
+        self,
+        dim,
+        heads,
+        bias_uniform_init = False,
+        base = 10000,
+    ):
+        super().__init__()
+        inv_freq = 1. / (base ** (arange(0, dim).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        self.learned_bias = nn.Parameter(torch.zeros(heads, 1, dim))
+
+        if bias_uniform_init:
+            self.learned_bias.uniform_(-2. * math.pi, 0.)
+
+    @autocast('cuda', enabled = False)
+    def forward(self, t, offset = 0):
+        max_pos = t.max() + 1
+
+        if t.ndim == 1:
+            t = rearrange(t, 'n -> 1 n')
+
+        freqs = torch.einsum('b i , j -> b i j', t.type_as(self.inv_freq), self.inv_freq)
+
+        bias = self.learned_bias.clamp(-2. * math.pi, 0.)
+
+        return freqs, bias
+
+@autocast('cuda', enabled = False)
+def apply_polar_pos_emb(t, freqs):
+    """
+    Apply Polar Position Embedding to input tensor.
+    Paper: https://arxiv.org/abs/2509.10534
+
+    This function converts the input tensor into polar coordinates using the provided
+    frequency encodings. The key steps are:
+    1. Apply softplus to ensure non-negative magnitudes (r ≥ 0)
+    2. Compute polar coordinates: (r*cos(θ), r*sin(θ))
+
+    The softplus activation ensures the magnitude is always positive, which is a
+    requirement for proper polar coordinate representation.
+
+    Args:
+        t: Input tensor of shape (..., seq_len, dim)
+        freqs: Frequency tensor from PolarEmbedding.forward()
+
+    Returns:
+        Tensor with polar position encoding applied, shape (..., seq_len, 2*dim)
+        where the output dimension is doubled due to (cos, sin) concatenation
+    """
+    rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
+    freqs = freqs[:, -seq_len:]
+
+    t = t.float()
+
+    # Apply softplus to ensure non-negative magnitude for polar coordinates
+    t = F.softplus(t)
+    # Convert to polar: concatenate (r*cos(θ), r*sin(θ))
+    out = cat((t * freqs.cos(), t * freqs.sin()), dim = -1)
+
+    return out.type(orig_dtype)
+
 # Normalization layers
 
 class Scale(Module):
@@ -1447,7 +1609,26 @@ class MultiheadRMSNorm(Module):
         return self.rmsnorm(x) * (self.gamma + 1.)
 
 class DynamicTanh(Module):
-    """ https://arxiv.org/abs/2503.10622 """
+    """
+    Dynamic Tanh Activation Function
+    Paper: https://arxiv.org/abs/2503.10622
+
+    A learnable tanh-based activation function with dynamic scaling and shifting.
+    Unlike standard tanh, this activation learns per-dimension scaling factors (gamma)
+    and bias terms (beta), as well as a global pre-tanh scaling (alpha) that controls
+    the saturation behavior of the tanh function.
+
+    The forward computation is: tanh(x * alpha) * gamma + beta
+
+    Args:
+        dim: Feature dimension (for per-dimension gamma and beta parameters)
+        init_alpha: Initial value for the pre-tanh scaling parameter (default: 1.0)
+        gamma: Initial value for post-tanh scaling (default: 1.0)
+        beta: Initial value for bias shift (default: 0.0)
+        unit_offset: If True, uses unit initialization where parameters start at
+                     identity-like values (gamma=1, alpha=1), making initial behavior
+                     similar to standard tanh (default: False)
+    """
     def __init__(
         self,
         dim,
@@ -1474,7 +1655,26 @@ class DynamicTanh(Module):
         return (x * pre_tanh_scale).tanh() * gamma + self.beta
 
 class Derf(Module):
-    """ https://arxiv.org/abs/2512.10938 """
+    """
+    Derf (Derivative of Error Function) Activation
+    Paper: https://arxiv.org/abs/2512.10938
+
+    Uses the error function (erf) as the activation, which is the integral of the
+    Gaussian distribution. The erf function has smooth, bounded behavior similar to
+    tanh but with different gradient characteristics that may be beneficial for training.
+
+    The error function is defined as: erf(x) = (2/√π) * ∫₀ˣ e^(-t²) dt
+
+    This activation applies learnable scaling and shifting both before and after the erf:
+    Forward computation: erf(x * alpha + s) * gamma + beta
+
+    Args:
+        dim: Feature dimension (for per-dimension gamma and beta parameters)
+        init_alpha: Initial value for the pre-erf scaling parameter (default: 0.5)
+        init_bias: Initial value for the shift term 's' applied before erf (default: 0.0)
+        unit_offset: If True, uses unit initialization for identity-like initial behavior
+                     (default: False)
+    """
     def __init__(
         self,
         dim,
@@ -1540,6 +1740,18 @@ class GRUGating(Module):
 
 # hyper connections
 
+def sinkhorn(t, iters = 20):
+    dtype = t.dtype
+    t = t.float()
+
+    t = t.softmax(dim = -2)
+
+    for _ in range(iters):
+        t = F.normalize(t, p = 1, dim = -1)
+        t = F.normalize(t, p = 1, dim = -2)
+
+    return t.to(dtype)
+
 class HyperConnection(Module):
     def __init__(
         self,
@@ -1548,16 +1760,17 @@ class HyperConnection(Module):
         layer_index,
         num_residual_streams,
         num_input_views = 1,
-        tanh = True,
+        sinkhorn_iters = 5,
         **kwargs
     ):
         """
         https://arxiv.org/abs/2409.19606
         Appendix J - Algorithm 2, Dynamic only
+
+        https://arxiv.org/abs/2512.24880
+        "Manifold constrained" mixing matrices
         """
         super().__init__()
-
-        self.act = nn.Tanh() if tanh else nn.Identity()
 
         self.norm = nn.LayerNorm(dim, bias = False)
 
@@ -1579,25 +1792,41 @@ class HyperConnection(Module):
         self.dynamic_beta_fn = nn.Parameter(torch.zeros(dim))
         self.dynamic_beta_scale = nn.Parameter(torch.ones(()) * 1e-2)
 
+        self.sinkhorn_iters = sinkhorn_iters
+
     def prepare(self, residuals):
+        views = self.num_input_views
+        streams = self.num_residual_streams
 
         residuals = rearrange(residuals, '(b s) n d -> b n s d', s = self.num_residual_streams)
 
         normed = self.norm(residuals)
 
-        wc_weight = self.act(normed @ self.dynamic_alpha_fn)
+        wc_weight = normed @ self.dynamic_alpha_fn
         dynamic_alpha = wc_weight * self.dynamic_alpha_scale
         alpha = dynamic_alpha + self.static_alpha
 
-        dc_weight = self.act(normed @ self.dynamic_beta_fn)
+        alpha_input, alpha_residual = alpha[..., :views], alpha[..., views:]
+
+        alpha_input = alpha_input.sigmoid() # constraint Hpre
+
+        # the sinkhorn knopps constraint for the residual mixing
+
+        alpha_residual = rearrange(alpha_residual, '... (s1 s2) -> ... s1 s2', s2 = streams)
+        alpha_residual = sinkhorn(alpha_residual, self.sinkhorn_iters)
+        alpha_residual = rearrange(alpha_residual, '... s1 s2 -> ... (s1 s2)')
+
+        alpha = cat((alpha_input, alpha_residual), dim = -1)
+
+        dc_weight = (normed @ self.dynamic_beta_fn).sigmoid() * 2
         dynamic_beta = dc_weight * self.dynamic_beta_scale
         beta = dynamic_beta + self.static_beta
+
+        beta = beta.sigmoid() * 2 # constraint Hpost
 
         # width connection
 
         mix_h = einsum('... s t, ... s d -> ... t d', alpha, residuals)
-
-        views = self.num_input_views
 
         if views == 1:
             branch_input, residuals = mix_h[..., 0, :], mix_h[..., 1:, :]
@@ -1832,29 +2061,44 @@ class GLU(Module):
 
 class FeedForward(Module):
     """
-    Standard feedforward network with various activation options.
+    Position-wise Feed-Forward Network with various activation options.
+    Base paper: "Attention is All You Need" https://arxiv.org/abs/1706.03762
 
-    Implements the FFN from "Attention is All You Need" with many extensions:
-    - Various activations (GELU, SiLU, ReLU², SoLU)
-    - GLU variants (Gated Linear Units)
-    - Optional post-activation normalization
-    - Configurable dropout
+    Implements the FFN: FFN(x) = activation(xW₁ + b₁)W₂ + b₂
+    with many extensions from the literature:
+
+    Activation Functions:
+    - GELU (default): Standard in BERT and GPT models
+    - SiLU/Swish: https://arxiv.org/abs/1606.08415
+    - ReLU²: https://arxiv.org/abs/2109.08668
+    - SoLU: "Softmax Linear Unit" https://arxiv.org/abs/1910.07467
+    - Dynamic Tanh: https://arxiv.org/abs/2503.10622
+    - Derf: https://arxiv.org/abs/2512.10938
+
+    Gating Mechanisms:
+    - GLU (Gated Linear Unit): https://arxiv.org/abs/1612.08083
+    - SwiGLU: "GLU Variants Improve Transformer" https://arxiv.org/abs/2002.05202
+
+    Architectural Improvements:
+    - Post-activation LayerNorm for stability
+    - Zero initialization for output projection (better training dynamics)
+    - Configurable expansion ratio (mult parameter, typically 4x)
 
     Args:
         dim: Input/output dimension
-        dim_out: Output dimension (if different from input)
-        mult: Multiplier for hidden dimension (default 4x)
-        glu: If True, use GLU activation
-        glu_mult_bias: If True, add learnable bias to GLU
-        swish: If True, use SiLU/Swish activation
-        relu_squared: If True, use squared ReLU
-        solu: If True, use SoLU activation
-        custom_activation: Custom activation module
-        post_act_ln: If True, add LayerNorm after activation
-        dropout: Dropout rate for hidden layer
-        sublayer_dropout: Dropout rate for output
-        no_bias: If True, use linear layers without bias
-        zero_init_output: If True, initialize output projection to zero
+        dim_out: Output dimension if different from input (default: None, uses dim)
+        mult: Multiplier for hidden dimension, typically 4 (default: 4)
+        glu: If True, use Gated Linear Unit variant (default: False)
+        glu_mult_bias: If True, add learnable multiplicative bias to GLU (default: False)
+        swish: If True, use SiLU/Swish activation (default: False, uses GELU)
+        relu_squared: If True, use squared ReLU activation (default: False)
+        solu: If True, use SoLU (Softmax Linear Unit) activation (default: False)
+        custom_activation: Custom activation module to use (default: None)
+        post_act_ln: If True, add LayerNorm after activation for stability (default: False)
+        dropout: Dropout rate for hidden layer (default: 0.0)
+        sublayer_dropout: Dropout rate for output (default: 0.0)
+        no_bias: If True, use linear layers without bias terms (default: False)
+        zero_init_output: If True, initialize output projection to zero (default: False)
     """
     def __init__(
         self,
@@ -1958,27 +2202,71 @@ class FeedForward(Module):
 class Attention(Module):
     """
     Multi-head attention with extensive customization options.
+    Base paper: "Attention Is All You Need" https://arxiv.org/abs/1706.03762
 
-    This is a highly flexible attention implementation supporting:
-    - Standard, causal, and cross attention
-    - Flash attention for efficiency
-    - Grouped query attention (GQA) and multi-query attention (MQA)
-    - Various positional encodings (RoPE, ALiBi, T5 bias, CoPE)
-    - QK normalization for stability
-    - Sparse attention (top-k)
-    - Talking heads
-    - Value gating
-    - Multi-latent attention (MLA)
-    - Hybrid modules (e.g., Mamba-like SSMs)
-    - And many more features...
+    This is a highly flexible attention implementation supporting numerous variants
+    and improvements from the literature:
+
+    Feature Categories and Related Papers:
+
+    1. Efficient Attention:
+       - Flash Attention: https://arxiv.org/abs/2205.14135
+       - Grouped/Multi-Query Attention (GQA/MQA): https://arxiv.org/abs/2305.13245
+       - Multi-Latent Attention (MLA): https://arxiv.org/abs/2405.04434
+
+    2. Positional Encodings (configured externally):
+       - RoPE: https://arxiv.org/abs/2104.09864
+       - ALiBi: https://arxiv.org/abs/2108.12409
+       - CoPE: https://arxiv.org/abs/2405.18719
+       - PoPE: https://arxiv.org/abs/2509.10534
+
+    3. Attention Mechanisms:
+       - Talking Heads: https://arxiv.org/abs/2003.02436
+       - Sparse (Top-K) Attention: https://arxiv.org/abs/1912.11637
+       - QK Normalization: https://arxiv.org/abs/2010.04245
+
+    4. Stability & Training:
+       - Value RMSNorm: Used in AlphaGenome and ByteDance's GR3
+       - Orthogonal Projected Values: https://openreview.net/forum?id=Ard2QzPAUK
+       - LASER (Layer-Selective Rank Reduction): https://arxiv.org/abs/2411.03493v1
+       - Zero init output: For better training initialization
+
+    5. Hybrid Architectures:
+       - Support for Mamba-like SSMs and other hybrid modules
+       - Learned mixing between attention and hybrid modules
 
     Args:
         dim: Model dimension
-        dim_head: Dimension per attention head
-        dim_context: Context dimension (for cross-attention)
-        heads: Number of attention heads
-        causal: If True, use causal (unidirectional) attention
-        flash: If True, use flash attention
+        dim_head: Dimension per attention head (default: 64)
+        dim_context: Context dimension for cross-attention (default: None, uses dim)
+        heads: Number of attention heads (default: 8)
+        causal: If True, use causal (unidirectional) attention (default: False)
+        flash: If True, use Flash Attention for efficiency (default: False)
+        pre_talking_heads: Apply talking heads before softmax (default: False)
+        post_talking_heads: Apply talking heads after softmax (default: False)
+        head_scale: Enable per-head scaling (default: False)
+        sparse_topk: If set, only attend to top-k values (sparse attention) (default: None)
+        num_mem_kv: Number of memory key-value pairs to add (default: 0)
+        dropout: Dropout rate for attention weights (default: 0.0)
+        gate_value_heads: Enable per-head value gating (default: False)
+        swiglu_values: Use SwiGLU activation for values (default: False)
+        gate_values: Enable global value gating (default: False)
+        zero_init_output: Initialize output projection to zero (default: False)
+        qk_norm: Apply normalization to queries and keys (default: False)
+        qk_norm_groups: Number of groups for QK normalization (default: 1)
+        value_rmsnorm: Apply RMSNorm to values for stability (default: False)
+        one_kv_head: Use single KV head (Multi-Query Attention) (default: False)
+        kv_heads: Number of KV heads for Grouped Query Attention (default: None)
+        data_dependent_alibi: Use data-dependent ALiBi biases (default: False)
+        use_cope: Use Contextual Position Encoding (default: False)
+        orthog_projected_values: Project values to orthogonal subspace (default: False)
+        laser: Enable LASER (Layer-Selective Rank Reduction) (default: False)
+        qkv_receive_diff_residuals: QKV projections receive different residual streams
+                                     (for hyper-connections) (default: False)
+        use_latent_q: Use latent query projections for MLA (default: False)
+        use_latent_kv: Use latent key-value projections for MLA (default: False)
+        dim_latent_q: Dimension of latent queries (default: None)
+        dim_latent_kv: Dimension of latent key-values (default: None)
     """
     def __init__(
         self,
@@ -2363,6 +2651,7 @@ class Attention(Module):
         attn_bias = None,
         rotary_pos_emb = None,
         context_rotary_pos_emb = None,
+        polar_pos_emb = None,
         pos = None, # for custom alibi positions
         prev_attn = None,
         mem = None,
@@ -2513,6 +2802,11 @@ class Attention(Module):
             if partial_rotate_heads:
                 q = cat((q_rest, q), dim = 1)
                 k = cat((k_rest, k), dim = 1)
+
+        if exists(polar_pos_emb):
+            freqs, bias = polar_pos_emb
+            q = apply_polar_pos_emb(q, freqs)
+            k = apply_polar_pos_emb(k, freqs + bias)
 
         input_mask = context_mask
 
@@ -2756,28 +3050,84 @@ class Attention(Module):
 
 class AttentionLayers(Module):
     """
-    Core transformer architecture with flexible layer configuration.
+    Core transformer layer stack with extensive architectural variants.
+    Base: "Attention Is All You Need" https://arxiv.org/abs/1706.03762
 
-    This class stacks attention and feedforward layers with extensive customization:
-    - Configurable layer types and execution order
-    - Pre-norm or post-norm architecture
-    - Various normalization types (LayerNorm, RMSNorm, etc.)
-    - Residual connections with optional gating or scaling
-    - Cross-attention for encoder-decoder models
-    - Relative and absolute positional encodings
-    - Memory/recurrence support
-    - U-Net style skip connections
-    - Layer integration (LIMe)
-    - Hyper-connections (multiple residual streams)
-    - And many more advanced features...
+    This class implements the core transformer architecture with support for numerous
+    improvements and variations from the research literature:
+
+    1. Normalization Variants:
+       - LayerNorm (standard): https://arxiv.org/abs/1607.06450
+       - RMSNorm: https://arxiv.org/abs/1910.07467
+       - ScaleNorm: https://arxiv.org/abs/1910.05895
+       - Adaptive LayerNorm/RMSNorm: For conditional generation
+
+    2. Positional Encodings:
+       - RoPE (Rotary Position Embedding): https://arxiv.org/abs/2104.09864
+       - ALiBi (Attention with Linear Biases): https://arxiv.org/abs/2108.12409
+       - PoPE (Polar Position Embedding): https://arxiv.org/abs/2509.10534
+       - T5 Relative Position Bias: https://arxiv.org/abs/1910.10683
+       - Dynamic Position Bias: https://arxiv.org/abs/2006.15595
+
+    3. Advanced Residual Architectures:
+       - Hyper-Connections (multiple residual streams): https://arxiv.org/abs/2409.19606
+         with manifold mixing: https://arxiv.org/abs/2512.24880
+       - Layer Integration (LIMe): https://arxiv.org/abs/2502.09245
+       - Value Residual (Resformer): https://arxiv.org/abs/2410.17897v1
+       - Deep Equilibrium Models: https://arxiv.org/abs/1909.01377
+
+    4. Architecture Variants:
+       - Pre-norm vs Post-norm
+       - Macaron (sandwich) architecture: FFN -> Attn -> FFN
+       - Parallel attention and FFN (PaLM style)
+       - U-Net skip connections for deep networks
+       - Weight tying across layers
+
+    5. Training Stability:
+       - LayerScale: https://arxiv.org/abs/2103.17239
+       - Zero initialization for branch outputs
+       - Adaptive LayerScale (DiT paper): https://arxiv.org/abs/2212.09748
+       - Output soft clamping to prevent overflow
 
     Args:
         dim: Model dimension
-        depth: Number of layers (can be None if using custom_layers)
-        heads: Number of attention heads
-        causal: If True, use causal attention
-        cross_attend: If True, add cross-attention layers
-        only_cross: If True, use only cross-attention (no self-attention)
+        depth: Number of layers (default: None, must set if not using custom_layers)
+        heads: Number of attention heads (default: 8)
+        causal: If True, use causal (autoregressive) attention (default: False)
+        cross_attend: If True, add cross-attention layers for encoder-decoder (default: False)
+        only_cross: If True, use only cross-attention without self-attention (default: False)
+
+        # Normalization options
+        use_scalenorm: Use ScaleNorm instead of LayerNorm (default: False)
+        use_rmsnorm: Use RMSNorm instead of LayerNorm (default: False)
+        use_simple_rmsnorm: Use simplified RMSNorm variant (default: False)
+        use_adaptive_layernorm: Use adaptive LayerNorm for conditioning (default: False)
+
+        # Activation options
+        use_dynamic_tanh: Use DynamicTanh activation in FFN (default: False)
+        use_derf: Use Derf activation in FFN (default: False)
+
+        # Position encoding options
+        rotary_pos_emb: Use RoPE positional encoding (default: False)
+        polar_pos_emb: Use PoPE positional encoding (default: False)
+        alibi_pos_bias: Use ALiBi positional bias (default: False)
+        rel_pos_bias: Use T5-style relative position bias (default: False)
+        dynamic_pos_bias: Use learned MLP for position bias (default: False)
+
+        # Advanced residual options
+        num_residual_streams: Number of parallel residual streams for hyper-connections
+                              (default: 1, set >1 to enable hyper-connections)
+        qkv_receive_diff_residuals: QKV projections receive different residual streams
+                                     (default: False)
+        integrate_layers: Enable layer integration (LIMe) (default: False)
+        add_value_residual: Add value residual connections (Resformer) (default: False)
+        reinject_input: Reinject input at each layer (DEQ-style) (default: False)
+
+        # Architecture options
+        pre_norm: If True, use pre-normalization; if False, post-norm (default: True)
+        macaron: Use macaron/sandwich architecture (FFN-Attn-FFN) (default: False)
+        unet_skips: Enable U-Net style skip connections (default: False)
+        custom_layers: Custom layer sequence, e.g., ('a', 'f', 'a', 'f') (default: None)
     """
     def __init__(
         self,
@@ -2816,6 +3166,8 @@ class AttentionLayers(Module):
         rotary_xpos_scale_base = 512,
         rotary_base_rescale_factor = 1.,
         rotate_num_heads = None,
+        polar_pos_emb = False,
+        polar_bias_uniform_init = False,
         weight_tie_layers = False,
         custom_layers: tuple[str, ...] | None = None,
         layers_execute_order: tuple[int, ...] | None = None,
@@ -2850,6 +3202,7 @@ class AttentionLayers(Module):
         learned_value_residual_mix = True,   # seeing big improvements when the value residual mix value is learned per token - credit goes to @faresobeid for taking the first step with learned scalar mix, then @Blinkdl for taking it a step further with data dependent. here we will use per token learned
         rel_pos_kwargs: dict = dict(),
         residual_fn_kwargs: dict = dict(),
+        hyper_conn_sinkhorn_iters = 5,
         verbose = True,
         **kwargs
     ):
@@ -2892,14 +3245,13 @@ class AttentionLayers(Module):
 
         # LIMe
 
-        hiddens_counter = 0
         self.layer_integrators = ModuleList([])
 
         assert not (qkv_receive_diff_residuals and not (hyper_conn_produce_diff_views or integrate_layers))
 
         # positions related
 
-        self.disable_abs_pos_emb = default(disable_abs_pos_emb, (rel_pos_bias or rotary_pos_emb))
+        self.disable_abs_pos_emb = default(disable_abs_pos_emb, (rel_pos_bias or rotary_pos_emb or polar_pos_emb))
 
         rotary_emb_dim = default(rotary_emb_dim, dim_head // 2)
 
@@ -2908,8 +3260,13 @@ class AttentionLayers(Module):
         if verbose and rotary_emb_dim < 32:
             logger.warning('when training language model, rotary embedding dimension should be at least 32')
 
+        assert at_most_one_of(rotary_pos_emb, polar_pos_emb), f'either rotary positional embedding or polar positional embedding can be turned on'
         assert not (rotary_xpos and not causal), 'rotary xpos is not compatible with bidirectional attention'
         self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim, use_xpos = rotary_xpos, scale_base = rotary_xpos_scale_base, interpolation_factor = rotary_interpolation_factor, base_rescale_factor = rotary_base_rescale_factor) if rotary_pos_emb else None
+
+        # polar positional embedding (PoPE) - https://arxiv.org/abs/2509.10534
+
+        self.polar_pos_emb = PolarEmbedding(dim_head, heads, polar_bias_uniform_init) if polar_pos_emb else None
 
         assert at_most_one_of(alibi_pos_bias, rel_pos_bias, data_dependent_alibi), 'you can only choose one of Alibi positional bias, data dependent Alibi (forgetting transformers), dynamic tanh, or T5 relative positional bias'
         assert rel_pos_num_buckets <= rel_pos_max_distance, 'number of relative position buckets must be less than the relative position max distance'
@@ -3177,7 +3534,7 @@ class AttentionLayers(Module):
                 layer_integrate = DynamicLIMe(dim, num_layer_hiddens, num_views = layer_integrate_num_view, use_softmax = layer_integrate_use_softmax)
 
             if has_hyper_connections:
-                residual_fn = partial(HyperConnection, num_residual_streams = num_residual_streams)
+                residual_fn = partial(HyperConnection, num_residual_streams = num_residual_streams, sinkhorn_iters = hyper_conn_sinkhorn_iters)
 
                 if layer_type == 'a' and hyper_conn_produce_diff_views:
                     residual_fn = partial(residual_fn, num_input_views = 3)
@@ -3268,6 +3625,7 @@ class AttentionLayers(Module):
         cache_age = 1,
         return_hiddens = False,
         rotary_pos_emb = None,
+        polar_pos_emb = None,
         pos = None,
         context_pos = None,
         attn_bias = None,
@@ -3362,6 +3720,15 @@ class AttentionLayers(Module):
                     rotary_pos_emb = rotary_pos_emb,
                     context_rotary_pos_emb = context_rotary_pos_emb
                 )
+
+        # polar positions
+
+        if exists(self.polar_pos_emb):
+            if not exists(polar_pos_emb):
+                if not exists(pos):
+                    pos = arange(x.shape[1] + seq_pos_offset, device = x.device)
+
+                polar_pos_emb = self.polar_pos_emb(pos)
 
         # assume cached key / values
 
@@ -3552,7 +3919,7 @@ class AttentionLayers(Module):
             # forward depending on layer type
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, kv_input_residual = next(self_attn_kv_residuals_iter, None), value_residual = maybe_self_attn_value_residual, return_intermediates = True)
+                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, polar_pos_emb = polar_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, kv_input_residual = next(self_attn_kv_residuals_iter, None), value_residual = maybe_self_attn_value_residual, return_intermediates = True)
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), kv_input_residual = next(cross_attn_kv_residuals_iter, None), value_residual = maybe_cross_attn_value_residual, **cross_attn_rotary_pos_emb, return_intermediates = True)
             elif layer_type == 'f':
