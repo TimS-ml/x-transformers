@@ -2581,4 +2581,28 @@ ids_out, num_out, is_number_mask = model.generate(start_ids, start_nums, 17)
 }
 ```
 
+```bibtex
+@misc{gopalakrishnan2025decouplingwhatwherepolar,
+    title   = {Decoupling the "What" and "Where" With Polar Coordinate Positional Embeddings}, 
+    author  = {Anand Gopalakrishnan and Robert Csordás and Jürgen Schmidhuber and Michael C. Mozer},
+    year    = {2025},
+    eprint  = {2509.10534},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2509.10534}, 
+}
+```
+
+```bibtex
+@misc{xie2025mhcmanifoldconstrainedhyperconnections,
+    title   = {mHC: Manifold-Constrained Hyper-Connections}, 
+    author  = {Zhenda Xie and Yixuan Wei and Huanqi Cao and Chenggang Zhao and Chengqi Deng and Jiashi Li and Damai Dai and Huazuo Gao and Jiang Chang and Liang Zhao and Shangyan Zhou and Zhean Xu and Zhengyan Zhang and Wangding Zeng and Shengding Hu and Yuqing Wang and Jingyang Yuan and Lean Wang and Wenfeng Liang},
+    year    = {2025},
+    eprint  = {2512.24880},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL},
+    url     = {https://arxiv.org/abs/2512.24880}, 
+}
+```
+
 *solve intelligence... then use that to solve everything else.* - Demis Hassabis

@@ -1286,6 +1286,50 @@ def apply_rotary_pos_emb(t, freqs, scale = 1):
 
     return out.type(orig_dtype)
 
+class PolarEmbedding(Module):
+    """ https://arxiv.org/abs/2509.10534 """
+
+    def __init__(
+        self,
+        dim,
+        heads,
+        bias_uniform_init = False,
+        base = 10000,
+    ):
+        super().__init__()
+        inv_freq = 1. / (base ** (arange(0, dim).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        self.learned_bias = nn.Parameter(torch.zeros(heads, 1, dim))
+
+        if bias_uniform_init:
+            self.learned_bias.uniform_(-2. * math.pi, 0.)
+
+    @autocast('cuda', enabled = False)
+    def forward(self, t, offset = 0):
+        max_pos = t.max() + 1
+
+        if t.ndim == 1:
+            t = rearrange(t, 'n -> 1 n')
+
+        freqs = torch.einsum('b i , j -> b i j', t.type_as(self.inv_freq), self.inv_freq)
+
+        bias = self.learned_bias.clamp(-2. * math.pi, 0.)
+
+        return freqs, bias
+
+@autocast('cuda', enabled = False)
+def apply_polar_pos_emb(t, freqs):
+    rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
+    freqs = freqs[:, -seq_len:]
+
+    t = t.float()
+
+    t = F.softplus(t)
+    out = cat((t * freqs.cos(), t * freqs.sin()), dim = -1)
+
+    return out.type(orig_dtype)
+
 # Normalization layers
 
 class Scale(Module):
@@ -1540,6 +1584,18 @@ class GRUGating(Module):
 
 # hyper connections
 
+def sinkhorn(t, iters = 20):
+    dtype = t.dtype
+    t = t.float()
+
+    t = t.softmax(dim = -2)
+
+    for _ in range(iters):
+        t = F.normalize(t, p = 1, dim = -1)
+        t = F.normalize(t, p = 1, dim = -2)
+
+    return t.to(dtype)
+
 class HyperConnection(Module):
     def __init__(
         self,
@@ -1548,16 +1604,17 @@ class HyperConnection(Module):
         layer_index,
         num_residual_streams,
         num_input_views = 1,
-        tanh = True,
+        sinkhorn_iters = 5,
         **kwargs
     ):
         """
         https://arxiv.org/abs/2409.19606
         Appendix J - Algorithm 2, Dynamic only
+
+        https://arxiv.org/abs/2512.24880
+        "Manifold constrained" mixing matrices
         """
         super().__init__()
-
-        self.act = nn.Tanh() if tanh else nn.Identity()
 
         self.norm = nn.LayerNorm(dim, bias = False)
 
@@ -1579,25 +1636,41 @@ class HyperConnection(Module):
         self.dynamic_beta_fn = nn.Parameter(torch.zeros(dim))
         self.dynamic_beta_scale = nn.Parameter(torch.ones(()) * 1e-2)
 
+        self.sinkhorn_iters = sinkhorn_iters
+
     def prepare(self, residuals):
+        views = self.num_input_views
+        streams = self.num_residual_streams
 
         residuals = rearrange(residuals, '(b s) n d -> b n s d', s = self.num_residual_streams)
 
         normed = self.norm(residuals)
 
-        wc_weight = self.act(normed @ self.dynamic_alpha_fn)
+        wc_weight = normed @ self.dynamic_alpha_fn
         dynamic_alpha = wc_weight * self.dynamic_alpha_scale
         alpha = dynamic_alpha + self.static_alpha
 
-        dc_weight = self.act(normed @ self.dynamic_beta_fn)
+        alpha_input, alpha_residual = alpha[..., :views], alpha[..., views:]
+
+        alpha_input = alpha_input.sigmoid() # constraint Hpre
+
+        # the sinkhorn knopps constraint for the residual mixing
+
+        alpha_residual = rearrange(alpha_residual, '... (s1 s2) -> ... s1 s2', s2 = streams)
+        alpha_residual = sinkhorn(alpha_residual, self.sinkhorn_iters)
+        alpha_residual = rearrange(alpha_residual, '... s1 s2 -> ... (s1 s2)')
+
+        alpha = cat((alpha_input, alpha_residual), dim = -1)
+
+        dc_weight = (normed @ self.dynamic_beta_fn).sigmoid() * 2
         dynamic_beta = dc_weight * self.dynamic_beta_scale
         beta = dynamic_beta + self.static_beta
+
+        beta = beta.sigmoid() * 2 # constraint Hpost
 
         # width connection
 
         mix_h = einsum('... s t, ... s d -> ... t d', alpha, residuals)
-
-        views = self.num_input_views
 
         if views == 1:
             branch_input, residuals = mix_h[..., 0, :], mix_h[..., 1:, :]
@@ -2363,6 +2436,7 @@ class Attention(Module):
         attn_bias = None,
         rotary_pos_emb = None,
         context_rotary_pos_emb = None,
+        polar_pos_emb = None,
         pos = None, # for custom alibi positions
         prev_attn = None,
         mem = None,
@@ -2513,6 +2587,11 @@ class Attention(Module):
             if partial_rotate_heads:
                 q = cat((q_rest, q), dim = 1)
                 k = cat((k_rest, k), dim = 1)
+
+        if exists(polar_pos_emb):
+            freqs, bias = polar_pos_emb
+            q = apply_polar_pos_emb(q, freqs)
+            k = apply_polar_pos_emb(k, freqs + bias)
 
         input_mask = context_mask
 
@@ -2816,6 +2895,8 @@ class AttentionLayers(Module):
         rotary_xpos_scale_base = 512,
         rotary_base_rescale_factor = 1.,
         rotate_num_heads = None,
+        polar_pos_emb = False,
+        polar_bias_uniform_init = False,
         weight_tie_layers = False,
         custom_layers: tuple[str, ...] | None = None,
         layers_execute_order: tuple[int, ...] | None = None,
@@ -2850,6 +2931,7 @@ class AttentionLayers(Module):
         learned_value_residual_mix = True,   # seeing big improvements when the value residual mix value is learned per token - credit goes to @faresobeid for taking the first step with learned scalar mix, then @Blinkdl for taking it a step further with data dependent. here we will use per token learned
         rel_pos_kwargs: dict = dict(),
         residual_fn_kwargs: dict = dict(),
+        hyper_conn_sinkhorn_iters = 5,
         verbose = True,
         **kwargs
     ):
@@ -2892,14 +2974,13 @@ class AttentionLayers(Module):
 
         # LIMe
 
-        hiddens_counter = 0
         self.layer_integrators = ModuleList([])
 
         assert not (qkv_receive_diff_residuals and not (hyper_conn_produce_diff_views or integrate_layers))
 
         # positions related
 
-        self.disable_abs_pos_emb = default(disable_abs_pos_emb, (rel_pos_bias or rotary_pos_emb))
+        self.disable_abs_pos_emb = default(disable_abs_pos_emb, (rel_pos_bias or rotary_pos_emb or polar_pos_emb))
 
         rotary_emb_dim = default(rotary_emb_dim, dim_head // 2)
 
@@ -2908,8 +2989,13 @@ class AttentionLayers(Module):
         if verbose and rotary_emb_dim < 32:
             logger.warning('when training language model, rotary embedding dimension should be at least 32')
 
+        assert at_most_one_of(rotary_pos_emb, polar_pos_emb), f'either rotary positional embedding or polar positional embedding can be turned on'
         assert not (rotary_xpos and not causal), 'rotary xpos is not compatible with bidirectional attention'
         self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim, use_xpos = rotary_xpos, scale_base = rotary_xpos_scale_base, interpolation_factor = rotary_interpolation_factor, base_rescale_factor = rotary_base_rescale_factor) if rotary_pos_emb else None
+
+        # polar positional embedding (PoPE) - https://arxiv.org/abs/2509.10534
+
+        self.polar_pos_emb = PolarEmbedding(dim_head, heads, polar_bias_uniform_init) if polar_pos_emb else None
 
         assert at_most_one_of(alibi_pos_bias, rel_pos_bias, data_dependent_alibi), 'you can only choose one of Alibi positional bias, data dependent Alibi (forgetting transformers), dynamic tanh, or T5 relative positional bias'
         assert rel_pos_num_buckets <= rel_pos_max_distance, 'number of relative position buckets must be less than the relative position max distance'
@@ -3177,7 +3263,7 @@ class AttentionLayers(Module):
                 layer_integrate = DynamicLIMe(dim, num_layer_hiddens, num_views = layer_integrate_num_view, use_softmax = layer_integrate_use_softmax)
 
             if has_hyper_connections:
-                residual_fn = partial(HyperConnection, num_residual_streams = num_residual_streams)
+                residual_fn = partial(HyperConnection, num_residual_streams = num_residual_streams, sinkhorn_iters = hyper_conn_sinkhorn_iters)
 
                 if layer_type == 'a' and hyper_conn_produce_diff_views:
                     residual_fn = partial(residual_fn, num_input_views = 3)
@@ -3268,6 +3354,7 @@ class AttentionLayers(Module):
         cache_age = 1,
         return_hiddens = False,
         rotary_pos_emb = None,
+        polar_pos_emb = None,
         pos = None,
         context_pos = None,
         attn_bias = None,
@@ -3362,6 +3449,15 @@ class AttentionLayers(Module):
                     rotary_pos_emb = rotary_pos_emb,
                     context_rotary_pos_emb = context_rotary_pos_emb
                 )
+
+        # polar positions
+
+        if exists(self.polar_pos_emb):
+            if not exists(polar_pos_emb):
+                if not exists(pos):
+                    pos = arange(x.shape[1] + seq_pos_offset, device = x.device)
+
+                polar_pos_emb = self.polar_pos_emb(pos)
 
         # assume cached key / values
 
@@ -3552,7 +3648,7 @@ class AttentionLayers(Module):
             # forward depending on layer type
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, kv_input_residual = next(self_attn_kv_residuals_iter, None), value_residual = maybe_self_attn_value_residual, return_intermediates = True)
+                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, polar_pos_emb = polar_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, kv_input_residual = next(self_attn_kv_residuals_iter, None), value_residual = maybe_self_attn_value_residual, return_intermediates = True)
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), kv_input_residual = next(cross_attn_kv_residuals_iter, None), value_residual = maybe_cross_attn_value_residual, **cross_attn_rotary_pos_emb, return_intermediates = True)
             elif layer_type == 'f':

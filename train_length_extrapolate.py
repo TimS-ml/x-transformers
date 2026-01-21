@@ -1,3 +1,11 @@
+# /// script
+# dependencies = [
+#   "accelerate",
+#   "tqdm",
+#   "x-transformers>=2.12.0",
+# ]
+# ///
+
 """
 Length Extrapolation Training Script
 
@@ -6,7 +14,7 @@ extrapolate to longer sequence lengths than seen during training. The model is t
 on sequences of length 256 but validated on progressively longer sequences (up to 4096)
 to evaluate how well it generalizes beyond the training sequence length.
 
-The model uses dynamic positional bias instead of absolute positional embeddings,
+The model uses polar positional embeddings instead of absolute positional embeddings,
 which is hypothesized to help with length extrapolation capabilities.
 """
 
@@ -22,6 +30,8 @@ import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from accelerate import Accelerator
+
 # constants
 
 # Total number of training batches to run
@@ -29,6 +39,9 @@ NUM_BATCHES = int(1e5)
 
 # Number of sequences processed in parallel
 BATCH_SIZE = 4
+
+# Validation batch size
+VALIDATE_BATCH_SIZE = 1
 
 # Number of gradient accumulation steps before updating weights
 # Effective batch size = BATCH_SIZE * GRADIENT_ACCUMULATE_EVERY = 16
@@ -47,7 +60,7 @@ GENERATE_LENGTH = 256
 SEQ_LEN = 256
 
 # Validate model performance every N batches
-VALIDATE_EVERY  = 100
+VALIDATE_EVERY  = 250
 
 # Sequence lengths to use during validation to test length extrapolation
 # Model is trained on 256 but tested on sequences up to 4096
@@ -94,6 +107,10 @@ def decode_tokens(tokens):
     """
     return ''.join(list(map(decode_token, tokens)))
 
+# accelerator
+
+accelerator = Accelerator()
+
 # instantiate GPT-like decoder model
 
 model = TransformerWrapper(
@@ -110,16 +127,15 @@ model = TransformerWrapper(
         depth = 6,
         # Number of attention heads
         heads = 8,
-        # Use dynamic positional bias instead of fixed positions
-        # This helps the model extrapolate to longer sequences
-        dynamic_pos_bias = True,
+        # Use polar positional embeddings for better length extrapolation
+        polar_pos_emb = True,
+        rotary_pos_emb = False,
+        dynamic_pos_bias = False
     )
 )
 
 # Wrap model for autoregressive text generation
 model = AutoregressiveWrapper(model)
-# Move model to GPU
-model.cuda()
 
 # prepare enwik8 data
 
@@ -162,15 +178,15 @@ class TextSamplerDataset(Dataset):
             index: Dataset index (not used, sampling is random)
 
         Returns:
-            A tensor of length (seq_len + 1) containing a sequence and its target,
-            moved to GPU. The extra token is for next-token prediction training.
+            A tensor of length (seq_len + 1) containing a sequence and its target.
+            The extra token is for next-token prediction training.
         """
         # Sample random starting position, ensuring we have enough data for full sequence
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
         # Extract sequence of length (seq_len + 1) for autoregressive training
         # The +1 allows using first seq_len tokens as input and last seq_len as targets
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        return full_seq
 
     def __len__(self):
         """
@@ -181,13 +197,23 @@ class TextSamplerDataset(Dataset):
         """
         return self.data.size(0) // self.seq_len
 
-# Create training dataset and infinite data loader
+# Create training dataset and data loader
 train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-# Wrap in cycle() for infinite iteration, drop_last ensures consistent batch sizes
-train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE, drop_last = True))
+train_loader  = DataLoader(train_dataset, batch_size = BATCH_SIZE, drop_last = True)
 
 # Create validation dataset for text generation sampling
 val_dataset_generate = TextSamplerDataset(data_val, SEQ_LEN)
+
+# optimizer
+
+optim = torch.optim.Adam(model.parameters(), lr = LEARNING_RATE)
+
+# prepare with accelerator
+
+model, optim, train_loader = accelerator.prepare(model, optim, train_loader)
+
+# Wrap in cycle() for infinite iteration after accelerator preparation
+train_loader = cycle(train_loader)
 
 # validation loaders with different sequence lengths
 
@@ -198,14 +224,10 @@ val_loaders = dict()
 for valid_seq_len in VALIDATE_SEQ_LENS:
     # Create dataset and loader for each validation sequence length
     val_dataset   = TextSamplerDataset(data_val, valid_seq_len)
-    val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last = True))
+    val_loader    = DataLoader(val_dataset, batch_size = VALIDATE_BATCH_SIZE, drop_last = True)
+    val_loader    = cycle(val_loader)
 
     val_loaders[valid_seq_len] = val_loader
-
-# optimizer
-
-# Adam optimizer for updating model parameters
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # training
 
@@ -216,51 +238,61 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
 
     # Gradient accumulation loop - accumulate gradients over multiple batches
     # before updating weights. This simulates a larger batch size with limited memory.
-    for __ in range(GRADIENT_ACCUMULATE_EVERY):
+    for _ in range(GRADIENT_ACCUMULATE_EVERY):
         # Get next batch and compute loss
         # AutoregressiveWrapper automatically handles input/target splitting
-        loss = model(next(train_loader))
+        data = next(train_loader)
+        loss = model(data)
         # Scale loss by accumulation steps to maintain gradient scale
-        (loss / GRADIENT_ACCUMULATE_EVERY).backward()
+        accelerator.backward(loss / GRADIENT_ACCUMULATE_EVERY)
 
-    print(f'training loss: {loss.item()}')
+        # Clip gradient norms when gradients are synchronized
+        if accelerator.sync_gradients:
+            accelerator.clip_grad_norm_(model.parameters(), 0.5)
 
-    # Clip gradient norms to prevent exploding gradients
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-    # Update model parameters based on accumulated gradients
-    optim.step()
-    # Clear gradients for next iteration
-    optim.zero_grad()
+        # Update model parameters based on accumulated gradients
+        optim.step()
+        # Clear gradients for next iteration
+        optim.zero_grad()
+
+    # Print training loss periodically
+    if i % 10 == 0:
+        accelerator.print(f'training loss: {loss.item()}')
 
     # Periodic validation to test length extrapolation
     if i % VALIDATE_EVERY == 0:
-        print(f'validation losses:\n')
+        accelerator.print(f'validation losses:\n')
 
         # Set model to evaluation mode (disables dropout, etc.)
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             # Validate on each of the different sequence lengths
             for valid_seq_len in VALIDATE_SEQ_LENS:
                 val_loader = val_loaders[valid_seq_len]
 
                 # Compute validation loss
-                loss = model(next(val_loader))
+                val_data = next(val_loader).to(accelerator.device)
+                loss = model(val_data)
                 # Print loss for this sequence length to monitor extrapolation performance
-                print(f'[{valid_seq_len}]:\t {loss.item()}')
+                accelerator.print(f'[{valid_seq_len}]:\t {loss.item()}')
 
-        print('\n')
+        accelerator.print('\n')
 
     # Periodic text generation to qualitatively assess model performance
     if i % GENERATE_EVERY == 0:
         model.eval()
+        # Unwrap model to access original model for generation
+        unwrapped_model = accelerator.unwrap_model(model)
+
         # Select random sequence from validation set and remove last token
         inp = random.choice(val_dataset_generate)[:-1]
+        inp = inp.to(accelerator.device)
         # Decode to human-readable text to show as prompt
         prime = decode_tokens(inp)
-        print(f'%s \n\n %s', (prime, '*' * 100))
+        accelerator.print(f'{prime} \n\n {"*" * 100}')
 
         # Generate continuation of the prompt
-        sample = model.generate(
+        sample = unwrapped_model.generate(
             prompts = inp,
             seq_len = GENERATE_LENGTH,
             # Use KV caching for efficient autoregressive generation
@@ -269,4 +301,4 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
 
         # Decode and print generated text
         output_str = decode_tokens(sample)
-        print(f'{output_str}\n\n')
+        accelerator.print(f'{output_str}\n\n')

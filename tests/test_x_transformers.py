@@ -954,18 +954,18 @@ def test_cross_attn_rotary(
         context_mask = context_mask
     )
 
-@param('tanh', (True, False))
-def test_hyper_connections(tanh):
+@param('qkv_receive_diff_residuals', (False, True))
+def test_hyper_connections(qkv_receive_diff_residuals):
     """
     Test hyper connections (multiple residual streams).
 
     Hyper connections use multiple parallel residual streams instead of a
     single residual connection, allowing the model to maintain multiple
-    information pathways. Optional tanh activation can be applied to control
-    the magnitude of residual contributions.
+    information pathways. The qkv_receive_diff_residuals parameter controls
+    whether query, key, and value projections receive different residual streams.
 
     Args:
-        tanh: If True, apply tanh activation to residual connections
+        qkv_receive_diff_residuals: If True, QKV projections receive different residual streams
     """
     # Create decoder with multiple residual streams (hyper connections)
     model = TransformerWrapper(
@@ -975,10 +975,8 @@ def test_hyper_connections(tanh):
             dim = 128,                   # Model dimension
             depth = 6,                   # Number of decoder layers
             heads = 8,                   # Number of attention heads
-            num_residual_streams = 8,    # 8 parallel residual streams
-            residual_fn_kwargs = dict(
-                tanh = tanh              # Apply tanh activation if True
-            )
+            num_residual_streams = 8,    # 8 dynamic hyper connection residual streams
+            qkv_receive_diff_residuals = qkv_receive_diff_residuals
         )
     )
 
@@ -2334,6 +2332,24 @@ def test_derf():
             attn_kv_heads = 4,
             rotary_pos_emb = True,
             use_derf = True
+        )
+    )
+
+    x = torch.randint(0, 256, (1, 10))
+
+    logits = model(x)
+
+def test_pope():
+    from x_transformers import TransformerWrapper, Decoder
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 6,
+            heads = 8,
+            polar_pos_emb = True,
         )
     )
 
