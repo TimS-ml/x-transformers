@@ -63,11 +63,12 @@ class ContinuousTransformerWrapper(Module):
     def __init__(
         self,
         *,
-        max_seq_len,
+        max_seq_len = None,
         attn_layers: AttentionLayers,
         dim_in = None,
         dim_out = None,
-        emb_dim = None,
+        project_in: Module | None = None,
+        project_out: Module | None = None,
         max_mem_len = 0,
         num_memory_tokens = None,
         post_emb_norm = False,
@@ -84,7 +85,7 @@ class ContinuousTransformerWrapper(Module):
 
         self.max_mem_len = max_mem_len
         
-        no_abs_pos_emb = max_seq_len == 0 or not (use_abs_pos_emb and not attn_layers.disable_abs_pos_emb)
+        no_abs_pos_emb = not exists(max_seq_len) or max_seq_len == 0 or not (use_abs_pos_emb and not attn_layers.disable_abs_pos_emb)
 
         if no_abs_pos_emb:
             self.pos_emb = always(0)
@@ -114,13 +115,16 @@ class ContinuousTransformerWrapper(Module):
 
         # project in and out
 
-        self.project_in = nn.Linear(dim_in, dim, bias = False) if exists(dim_in) else nn.Identity()
+        assert not (exists(dim_in) and exists(project_in)), 'either `dim_in` or `project_in` can be passed in, but not both'
+        assert not (exists(dim_out) and exists(project_out)), 'either `dim_out` or `project_out` can be passed in, but not both'
+
+        self.project_in = default(project_in, lambda: nn.Linear(dim_in, dim, bias = False) if exists(dim_in) else nn.Identity())
 
         # output is multipled by 2 for outputting mean and log variance
 
         self.probabilistic = probabilistic
 
-        self.project_out = nn.Linear(dim, dim_out * (2 if probabilistic else 1), bias = False) if exists(dim_out) else nn.Identity()
+        self.project_out = default(project_out, lambda: nn.Linear(dim, dim_out * (2 if probabilistic else 1), bias = False) if exists(dim_out) else nn.Identity())
 
         # can cache kv
 
@@ -293,7 +297,9 @@ class ContinuousAutoregressiveWrapper(Module):
         cache = None
 
         for _ in range(seq_len):
-            x = out[:, -self.max_seq_len:]
+            x = out
+            if exists(self.max_seq_len):
+                x = x[:, -self.max_seq_len:]
 
             net_out, new_cache = self.net(x, cache = cache, return_intermediates = True, **kwargs)
 
