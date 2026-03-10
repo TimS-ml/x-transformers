@@ -30,17 +30,7 @@ def exists(val):
     return val is not None
 
 def divisible_by(numer, denom):
-    """
-    Check if a number is evenly divisible by another number.
-
-    Args:
-        numer: The numerator (dividend)
-        denom: The denominator (divisor)
-
-    Returns:
-        bool: True if numer is evenly divisible by denom, False otherwise
-    """
-    return (numer % denom) == 0 
+    return (numer % denom) == 0
 
 # xl autoregressive wrapper class
 
@@ -303,7 +293,6 @@ class XLAutoregressiveWrapper(nn.Module):
 
         # Process each chunk and accumulate weighted losses
 
-        # Initialize total loss accumulator
         total_loss = 0.
 
         # Iterate through all chunks with their labels and weights

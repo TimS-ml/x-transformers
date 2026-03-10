@@ -284,7 +284,6 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         # Unwrap model to access original model for generation
         unwrapped_model = accelerator.unwrap_model(model)
 
-        # Select random sequence from validation set and remove last token
         inp = random.choice(val_dataset_generate)[:-1]
         inp = inp.to(accelerator.device)
         # Decode to human-readable text to show as prompt

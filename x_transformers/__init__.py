@@ -61,6 +61,7 @@ from x_transformers.x_transformers import (
     AdaptiveRMSNorm,
     TransformerWrapper,
     ViTransformerWrapper,
+    TransformerBlock,
 )
 
 # Training wrappers

@@ -148,9 +148,8 @@ class MultiInputTransformerWrapper(Module):
             # Use standard learned absolute positional embeddings
             self.pos_emb = AbsolutePositionalEmbedding(emb_dim, max_seq_len)
 
-        # Create embedding layers for each input type
-        # For example, if num_tokens = {'token': 50000, 'segment': 2}, this creates
-        # two embedding tables: 'token_embed' and 'segment_embed'
+        # additional embeddings - say type embedding from BERT
+
         self.embeds = ModuleDict({f'{name}_embed': nn.Embedding(one_num_tokens, emb_dim) for name, one_num_tokens in num_tokens.items()})
 
         # Gradient scaling for embeddings - can help with training stability
@@ -315,6 +314,7 @@ class MultiInputTransformerWrapper(Module):
 
         # Check if positional embeddings are provided externally (not as indices)
         external_pos_emb = exists(pos) and pos.dtype != torch.long
+        pos_emb = self.pos_emb(first_input, pos = pos, seq_start_pos = seq_start_pos) if not external_pos_emb else pos
 
         # Get positional embeddings: either compute from position indices or use external embeddings
         pos_emb = self.pos_emb(first_input, pos = pos, seq_start_pos = seq_start_pos) if not external_pos_emb else pos
