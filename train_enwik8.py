@@ -2,7 +2,9 @@
 # dependencies = [
 #   "tqdm",
 #   "x-transformers",
-#   "wandb"
+#   "wandb",
+#   "fire",
+#   "accelerate"
 # ]
 # ///
 
@@ -35,41 +37,17 @@ import torch
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-
-# constants
-
-# Total number of training batches to process (100,000 iterations)
-NUM_BATCHES = int(1e5)
-
-# Number of sequences to process in each batch
-BATCH_SIZE = 4
-
-# Number of forward passes to accumulate gradients before updating weights
-# Effective batch size = BATCH_SIZE * GRADIENT_ACCUMULATE_EVERY = 16
-# This allows training with larger effective batch sizes without exceeding GPU memory
-GRADIENT_ACCUMULATE_EVERY = 4
-
-# Learning rate for the Adam optimizer
-LEARNING_RATE = 1e-4
-
-# Frequency (in batches) to run validation and log validation loss
-VALIDATE_EVERY  = 100
-
-# Frequency (in batches) to generate sample text and display output
-# Set higher than VALIDATE_EVERY to reduce generation overhead
-GENERATE_EVERY  = 500
-
-# Length of generated text samples (in characters/bytes)
-GENERATE_LENGTH = 1024
-
-# Maximum sequence length for training (in characters/tokens)
-SEQ_LEN = 1024
-
-# Whether to track experiment metrics online with Weights & Biases
-# Set to False for offline/local logging only
-TRACK_EXPERIMENT_ONLINE = False
+import fire
+import wandb
+from accelerate import Accelerator
 
 # helpers
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
 
 def cycle(loader):
     """
@@ -120,193 +98,120 @@ def decode_tokens(tokens):
     """
     return ''.join(list(map(decode_token, tokens)))
 
-# instantiate GPT-like decoder model
+def train(
+    num_batches = int(1e5),
+    batch_size = 4,
+    gradient_accumulate_every = 4,
+    learning_rate = 1e-4,
+    validate_every = 100,
+    generate_every = 500,
+    generate_length = None,
+    seq_len = 1024,
+    track_experiment_online = False,
+    run_name = 'baseline',
+    cpu = False
+):
+    accelerator = Accelerator(cpu=cpu)
+    device = accelerator.device
 
-# Create the base transformer model for character-level language modeling
-# num_tokens = 256: vocabulary size (one token per byte value 0-255)
-# max_seq_len = SEQ_LEN: maximum sequence length the model can process
-model = TransformerWrapper(
-    num_tokens = 256,
-    max_seq_len = SEQ_LEN,
-    attn_layers = Decoder(
-        dim = 512,          # Hidden dimension size for embeddings and attention
-        depth = 6,          # Number of transformer layers (blocks)
-        heads = 8,          # Number of attention heads per layer
-        rotary_pos_emb = True,  # Use rotary positional embeddings (RoPE) instead of learned positional embeddings
-        attn_orthog_projected_values = True,  # Apply orthogonal projection to attention values (experimental feature)
-        attn_orthog_projected_values_per_head = True  # Apply orthogonal projection per attention head
-    )
-)
+    generate_length = default(generate_length, seq_len)
 
-# Wrap the model for autoregressive text generation
-# This wrapper handles the forward pass for language modeling (predicting next token)
-# and provides a generate() method for sampling text
-model = AutoregressiveWrapper(model)
+    # instantiate GPT-like decoder model
 
-# Move model to GPU for faster training
-model.cuda()
-
-# prepare enwik8 data
-
-# Load the enwik8 dataset (first 100M bytes of Wikipedia XML)
-# This is a standard benchmark for character-level language modeling
-# Read 95M bytes total, split into 90M for training and 5M for validation
-with gzip.open('./data/enwik8.gz') as file:
-    # Read data as unsigned 8-bit integers (bytes 0-255)
-    data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-    # Split into training (first 90M bytes) and validation (remaining 5M bytes)
-    train_x, valid_x = np.split(data, [int(90e6)])
-    # Convert numpy arrays to PyTorch tensors
-    data_train, data_val = torch.from_numpy(train_x), torch.from_numpy(valid_x)
-
-class TextSamplerDataset(Dataset):
-    """
-    Dataset that samples random subsequences from a text corpus.
-
-    This dataset provides random contiguous sequences of specified length from
-    the input data. Each call to __getitem__ returns a randomly positioned
-    sequence, enabling the model to see diverse contexts during training without
-    being limited by fixed epoch boundaries.
-    """
-
-    def __init__(self, data, seq_len):
-        """
-        Initialize the text sampler dataset.
-
-        Args:
-            data: PyTorch tensor containing the full text data as byte values (0-255)
-            seq_len: Length of sequences to sample
-        """
-        super().__init__()
-        self.data = data
-        self.seq_len = seq_len
-
-    def __getitem__(self, index):
-        """
-        Sample a random sequence from the dataset.
-
-        The index parameter is ignored; sampling is always random. This allows
-        the dataset to provide fresh random samples on each iteration.
-
-        Args:
-            index: Dataset index (not used; sampling is random regardless)
-
-        Returns:
-            Tensor of shape (seq_len + 1,) containing a sequence and its next token,
-            moved to GPU. The +1 allows for input/target splitting during training:
-            - input: sequence[:seq_len]
-            - target: sequence[1:seq_len+1]
-        """
-        # Randomly select a starting position that leaves room for full sequence
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
-        # Extract sequence of length seq_len + 1 (for input and target)
-        full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        # Move to GPU and return
-        return full_seq.cuda()
-
-    def __len__(self):
-        """
-        Return the number of possible sequences in the dataset.
-
-        This is used by DataLoader to determine dataset size, though with random
-        sampling the actual number of unique sequences seen depends on training steps.
-
-        Returns:
-            Number of non-overlapping sequences that fit in the data
-        """
-        return self.data.size(0) // self.seq_len
-
-# Create dataset instances for training and validation
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
-
-# Create infinite data loaders using the cycle helper function
-# drop_last = True ensures all batches have exactly BATCH_SIZE samples,
-# preventing issues with the last incomplete batch
-train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE, drop_last = True))
-val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last = True))
-
-# optimizer
-
-# Initialize Adam optimizer with specified learning rate
-# Adam is used for its adaptive learning rates per parameter and built-in momentum
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-# experiment
-
-# Initialize Weights & Biases for experiment tracking
-# This logs training metrics, hyperparameters, and system info
-import wandb
-# mode = 'online': sync to wandb servers, 'disabled': local logging only
-wandb.init(project = 'enwik8', mode = 'online' if TRACK_EXPERIMENT_ONLINE else 'disabled')
-# Set a name for this experiment run to distinguish it from other runs
-wandb.run.name = 'baseline'
-
-# training
-
-# Main training loop - iterate over NUM_BATCHES batches with progress bar
-# mininterval=10. updates progress bar at most every 10 seconds to reduce overhead
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
-    # Set model to training mode (enables dropout, layer norm in training mode, etc.)
-    model.train()
-
-    # Gradient accumulation loop: accumulate gradients over multiple mini-batches
-    # This simulates a larger batch size (BATCH_SIZE * GRADIENT_ACCUMULATE_EVERY = 16)
-    # without requiring more GPU memory, which is important for large models
-    for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        # Forward pass: compute loss on next training batch
-        # The model computes cross-entropy loss for next-token prediction
-        loss = model(next(train_loader))
-        # Backward pass: scale loss and compute gradients
-        # Scaling by GRADIENT_ACCUMULATE_EVERY ensures the average gradient
-        # magnitude matches what we'd get with a single larger batch
-        (loss / GRADIENT_ACCUMULATE_EVERY).backward()
-
-    # Print the training loss (from the last accumulated batch)
-    print(f'training loss: {loss.item()}')
-    # Log training loss to Weights & Biases for tracking over time
-    wandb.log(dict(loss = loss.item()))
-
-    # Gradient clipping: prevent exploding gradients by capping the norm
-    # Max norm of 0.5 helps stabilize training, especially early on
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-
-    # Update model parameters using the accumulated gradients
-    optim.step()
-    # Clear gradients for the next iteration
-    optim.zero_grad()
-
-    # Validation: periodically evaluate model on held-out validation set
-    if i % VALIDATE_EVERY == 0:
-        # Set model to evaluation mode (disables dropout, etc.)
-        model.eval()
-        with torch.no_grad():  # Disable gradient computation to save memory
-            # Compute loss on validation batch
-            loss = model(next(val_loader))
-
-            # Print and log validation loss
-            print(f'validation loss: {loss.item()}')
-            wandb.log(dict(valid_loss = loss.item()))
-
-    # Text generation: periodically generate samples to qualitatively monitor training
-    if i % GENERATE_EVERY == 0:
-        # Set model to evaluation mode for generation
-        model.eval()
-        # Select a random validation sequence to use as prompt
-        # Remove last token [:-1] since we want to predict from this prefix
-        inp = random.choice(val_dataset)[:-1]
-        # Decode the prompt to show what we're starting with
-        prime = decode_tokens(inp)
-        print(f'%s \n\n %s', (prime, '*' * 100))
-
-        # Generate continuation using autoregressive sampling
-        # cache_kv = True enables key-value caching for faster generation
-        sample = model.generate(
-            prompts = inp,
-            seq_len = GENERATE_LENGTH,  # Generate this many additional tokens
-            cache_kv = True  # Cache attention keys/values for efficiency
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = seq_len,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 6,
+            heads = 8,
+            rotary_pos_emb = False,
+            polar_pos_emb = True,
+            attn_aggregated_residuals = True
         )
+    )
 
-        # Decode and print the generated text
-        output_str = decode_tokens(sample)
-        print(output_str)
+    model = AutoregressiveWrapper(model)
+
+    # prepare enwik8 data
+
+    with gzip.open('./data/enwik8.gz') as file:
+        data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+        train_x, valid_x = np.split(data, [int(90e6)])
+        data_train, data_val = torch.from_numpy(train_x), torch.from_numpy(valid_x)
+
+    class TextSamplerDataset(Dataset):
+        def __init__(self, data, seq_len):
+            super().__init__()
+            self.data = data
+            self.seq_len = seq_len
+
+        def __getitem__(self, index):
+            rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
+            full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
+            return full_seq.to(device)
+
+        def __len__(self):
+            return self.data.size(0) // self.seq_len
+
+    train_dataset = TextSamplerDataset(data_train, seq_len)
+    val_dataset   = TextSamplerDataset(data_val, seq_len)
+    train_loader  = cycle(DataLoader(train_dataset, batch_size = batch_size, drop_last = True))
+    val_loader    = cycle(DataLoader(val_dataset, batch_size = batch_size, drop_last = True))
+
+    # optimizer
+
+    optim = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    # experiment
+
+    wandb.init(project = 'enwik8', mode = 'online' if track_experiment_online else 'disabled')
+    wandb.run.name = run_name
+
+    model, optim, train_loader, val_loader = accelerator.prepare(
+        model, optim, train_loader, val_loader
+    )
+
+    # training
+
+    for i in tqdm.tqdm(range(num_batches), mininterval=10., desc='training'):
+        model.train()
+
+        for _ in range(gradient_accumulate_every):
+            loss = model(next(train_loader))
+            accelerator.backward(loss / gradient_accumulate_every)
+
+        print(f'training loss: {loss.item()}')
+        if accelerator.is_main_process:
+            wandb.log(dict(loss = loss.item()))
+
+        accelerator.clip_grad_norm_(model.parameters(), 0.5)
+        optim.step()
+        optim.zero_grad()
+
+        if i % validate_every == 0:
+            model.eval()
+            with torch.no_grad():
+                loss = model(next(val_loader))
+
+                print(f'validation loss: {loss.item()}')
+                if accelerator.is_main_process:
+                    wandb.log(dict(valid_loss = loss.item()))
+
+        if i % generate_every == 0:
+            model.eval()
+            inp = random.choice(val_dataset)[:-1]
+            prime = decode_tokens(inp.cpu().numpy())
+            print(f'%s \n\n %s' % (prime, '*' * 100))
+
+            sample = model.generate(
+                prompts = inp,
+                seq_len = generate_length,
+                cache_kv = True
+            )
+
+            output_str = decode_tokens(sample.cpu().numpy())
+            print(output_str)
+
+if __name__ == '__main__':
+    fire.Fire(train)

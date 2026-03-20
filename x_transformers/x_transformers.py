@@ -20,7 +20,7 @@ from torch.nn import Module, ModuleList, ModuleDict
 
 from loguru import logger
 
-from x_transformers.attend import Attend, Intermediates
+from x_transformers.attend import Attend, Intermediates, pack_one, unpack_one
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 
 import einx
@@ -170,7 +170,10 @@ def orthog_project(x, y):
     y, _ = pack([y], 'b *')
 
     dtype = x.dtype
-    x, y = x.double(), y.double()
+
+    if x.device.type != 'mps':
+        x, y = x.double(), y.double()
+
     unit = F.normalize(y, dim = -1)
 
     parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
@@ -1054,6 +1057,108 @@ class GRUGating(Module):
 
         return gated_output.reshape_as(x)
 
+class AttentionAggregatedResidual(Module):
+    """
+    https://arxiv.org/abs/2601.21582
+    https://arxiv.org/abs/2603.15031
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_views = 1,
+        heads = 4,
+        dim_head = 64,
+        rotary_pos_emb = True,
+        polar_pos_emb = False,
+        last_layer_hiddens_as_query = True,
+        attn_kwargs: dict = dict(),
+        **kwargs
+    ):
+        super().__init__()
+        assert at_most_one_of(rotary_pos_emb, polar_pos_emb), 'either rotary or polar positional embedding can be used, not both'
+
+        attn_kwargs = dict(
+            k_rmsnorm = True,
+            **attn_kwargs
+        )
+
+        self.num_views = num_views
+        self.multiple_views = num_views > 1
+        self.last_layer_hiddens_as_query = last_layer_hiddens_as_query
+
+        self.attn_pool = AttentionPool(
+            dim = dim,
+            dim_context = dim,
+            num_pooled_tokens = num_views if not last_layer_hiddens_as_query else 0,
+            use_transformer_blocks = False,
+            heads = heads,
+            dim_head = dim_head,
+            attn_kwargs = attn_kwargs
+        )
+
+        self.to_queries = None
+
+        if last_layer_hiddens_as_query:
+            self.to_queries = nn.Sequential(
+                nn.RMSNorm(dim),
+                nn.Linear(dim, dim * num_views, bias = False),
+                Rearrange('b n (v d) -> (b n) v d', v = num_views)
+            )
+
+        self.use_rotary = rotary_pos_emb
+        self.use_polar = polar_pos_emb
+
+        if polar_pos_emb:
+            self.pos_emb = PolarEmbedding(dim_head, heads)
+        elif rotary_pos_emb:
+            self.pos_emb = RotaryEmbedding(dim_head)
+        else:
+            self.pos_emb = None
+
+    def forward(
+        self,
+        x,
+        hiddens: list[Tensor] | None = None,
+        **kwargs
+    ):
+        assert exists(hiddens), 'hiddens must be passed to AttentionAggregatedResidual'
+
+        hiddens = stack(hiddens, dim = 1)
+
+        hiddens = rearrange(hiddens, 'b l n d -> b n l d')
+        hiddens, packed_shape = pack_one(hiddens, '* l d')
+
+        # positional embeddings for layer depth distance
+
+        attn_kwargs = dict()
+
+        if exists(self.pos_emb):
+            num_layers = hiddens.shape[-2]
+            positions = arange(num_layers, device = x.device)
+            pos_emb = self.pos_emb(positions)
+
+            if self.use_polar:
+                attn_kwargs.update(polar_pos_emb = pos_emb)
+            else:
+                attn_kwargs.update(rotary_pos_emb = pos_emb, context_rotary_pos_emb = pos_emb)
+
+        queries = None
+
+        if self.last_layer_hiddens_as_query:
+            queries = self.to_queries(x)
+
+        pooled = self.attn_pool(hiddens, queries = queries, **attn_kwargs)
+
+        if self.multiple_views:
+            pooled = rearrange(pooled, '... v d -> v ... d', v = self.num_views)
+            pooled = unpack_one(pooled, packed_shape, 'v * d')
+        else:
+            pooled = rearrange(pooled, '... 1 d -> ... d')
+            pooled = unpack_one(pooled, packed_shape, '* d')
+
+        return pooled
+
 # hyper connections
 
 def sinkhorn(t, iters = 20):
@@ -1152,7 +1257,7 @@ class HyperConnection(Module):
 
         return branch_input, residuals, dict(beta = beta)
 
-    def forward(self, x, residuals, *, beta):
+    def forward(self, x, residuals, *, beta, **kwargs):
         residuals = einsum('b n d, b n s -> b n s d', x, beta) + residuals
         return rearrange(residuals, 'b n s d -> (b s) n d')
 
@@ -1467,6 +1572,8 @@ class Attention(Module):
         qk_norm_groups = 1,
         qk_norm_scale = 10,
         qk_norm_dim_scale = False,
+        qk_rmsnorm = False,
+        k_rmsnorm = False,
         value_rmsnorm = False,      # used in alphagenome and bytedance's GR3 for further stability
         l2_distance = False,
         sigmoid = False,
@@ -1503,6 +1610,7 @@ class Attention(Module):
         laser = False,                    # https://arxiv.org/abs/2411.03493v1
         laser_softclamp_value = 15.,
         qkv_receive_diff_residuals = False,
+        project_out = None,
         use_latent_q = False,
         dim_latent_q = None,
         use_latent_kv = False,
@@ -1631,7 +1739,14 @@ class Attention(Module):
         assert (not qk_norm) or divisible_by(dim_head, qk_norm_groups), 'dimension per attention head must be divisible by the qk norm groups'
         assert not (qk_norm and (dim_head // qk_norm_groups) <= 2), 'the group dimension may be too small (2 was too small in my tests, but 4 still works, surprisingly)'
 
-        # value rms norm
+        # qk rmsnorm
+
+        assert not (qk_rmsnorm and k_rmsnorm), 'qk_rmsnorm and k_rmsnorm cannot both be set to True'
+
+        self.q_rmsnorm = MultiheadRMSNorm(dim_head, heads = heads) if qk_rmsnorm else None
+        self.k_rmsnorm = MultiheadRMSNorm(dim_head, heads = kv_heads) if (qk_rmsnorm or k_rmsnorm) else None
+
+        # value rmsnorm
 
         self.value_rmsnorm = MultiheadRMSNorm(dim_head, heads = heads) if value_rmsnorm else None
 
@@ -1760,7 +1875,13 @@ class Attention(Module):
         # output dimension by default same as input, but can be overridden
 
         dim_out = default(dim_out, dim)
-        self.to_out = nn.Sequential(LinearNoBias(out_dim, dim_out * 2), nn.GLU()) if on_attn else LinearNoBias(out_dim, dim_out)
+
+        need_project_out = default(project_out, heads > 1 or dim != dim_out or on_attn)
+
+        if need_project_out:
+            self.to_out = nn.Sequential(LinearNoBias(out_dim, dim_out * 2), nn.GLU()) if on_attn else LinearNoBias(out_dim, dim_out)
+        else:
+            self.to_out = nn.Identity()
 
         # sublayer dropout
 
@@ -1836,8 +1957,11 @@ class Attention(Module):
         additional_key_value_mask = None,
         kv_input_residual = None,
         flash_pack_seq_kwargs = None,
+        causal = None,
     ):
         b, n, h, kv_h, head_scale, num_mem_kv, device, has_context, qkv_receive_diff_residuals, is_multi_latent_attn = x.shape[0], x.shape[1], self.heads, self.kv_heads, self.head_scale, self.num_mem_kv, x.device, exists(context), self.qkv_receive_diff_residuals, self.use_latent_kv
+
+        causal = default(causal, self.causal)
 
         # an interesting possibility with hyper connections
         # having queries, keys, values be routed from different layers
@@ -1924,8 +2048,13 @@ class Attention(Module):
             q, k = map(qk_l2norm, (q, k))
             scale = self.qk_norm_scale
 
-            q = q * self.qk_norm_q_scale
-            k = k * self.qk_norm_k_scale
+            q = q * scale
+            k = k * scale
+
+        # maybe qk rmsnorm
+
+        q = maybe(self.q_rmsnorm)(q)
+        k = maybe(self.k_rmsnorm)(k)
 
         # maybe value rmsnorm
 
@@ -2104,6 +2233,7 @@ class Attention(Module):
             attn_bias = attn_bias,
             prev_attn = prev_attn,
             flash_pack_seq_kwargs = flash_pack_seq_kwargs,
+            causal = causal,
         )
 
         # laser
@@ -2136,7 +2266,7 @@ class Attention(Module):
 
             hybrid_forward_kwargs = dict()
 
-            if not self.causal and exists(self.hybrid_mask_kwarg):
+            if not causal and exists(self.hybrid_mask_kwarg):
                 hybrid_forward_kwargs = {self.hybrid_mask_kwarg: mask}
 
             # handle maybe hybrid cache
@@ -2273,6 +2403,9 @@ class AttentionLayers(Module):
         macaron = False,
         pre_norm = True,
         pre_norm_has_final_norm = True,
+        attn_aggregated_residuals = False,
+        attn_residuals_last_output_as_query = False,
+        attn_aggregated_residual_kwargs: dict = dict(),
         gate_residual = False,
         scale_residual = False,
         scale_residual_constant = 1.,
@@ -2389,6 +2522,8 @@ class AttentionLayers(Module):
 
         self.pre_norm = pre_norm
         self.sandwich_norm = sandwich_norm
+
+        assert at_most_one_of(gate_residual, attn_aggregated_residuals), 'gate_residual and attn_aggregated_residuals are mutually exclusive'
 
         self.residual_attn = residual_attn
         self.cross_residual_attn = cross_residual_attn
@@ -2629,6 +2764,19 @@ class AttentionLayers(Module):
 
                 layer_integrate = DynamicLIMe(dim, num_layer_hiddens, num_views = layer_integrate_num_view, use_softmax = layer_integrate_use_softmax)
 
+            elif attn_aggregated_residuals:
+                layer_integrate_num_view = 3 if layer_qkv_receives_diff_view else 1
+                layer_integrate = AttentionAggregatedResidual(
+                    dim,
+                    num_views = layer_integrate_num_view,
+                    heads = heads,
+                    dim_head = dim_head,
+                    rotary_pos_emb = rotary_pos_emb,
+                    polar_pos_emb = polar_pos_emb,
+                    last_layer_hiddens_as_query = attn_residuals_last_output_as_query,
+                    attn_kwargs = attn_aggregated_residual_kwargs
+                )
+
             if has_hyper_connections:
                 residual_fn = partial(HyperConnection, num_residual_streams = num_residual_streams, sinkhorn_iters = hyper_conn_sinkhorn_iters)
 
@@ -2682,8 +2830,6 @@ class AttentionLayers(Module):
         tau = 100.
     ):
         # pairs up the attention intermediates with each attention module and does qk clip proposed by kimi team
-
-        layer_and_layer_types = (self.layers, self.layer_types)
 
         attn_layers = [layer for (_, layer, _), layer_type in zip(self.layers, self.layer_types) if layer_type in ('a', 'c')]
         attn_intermeds = intermediates.attn_intermediates
@@ -2741,6 +2887,7 @@ class AttentionLayers(Module):
         cross_attn_kv_residuals: Tensor | None = None,
         flash_pack_seq_kwargs = None,
         flash_pack_seq_context_kwargs = None,
+        causal = None,
     ):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
         assert not (exists(condition) ^ self.need_condition), 'condition needs to be passed in if using adaptive layernorm or vice versa'
@@ -3025,7 +3172,7 @@ class AttentionLayers(Module):
             # forward depending on layer type
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, polar_pos_emb = polar_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, kv_input_residual = next(self_attn_kv_residuals_iter, None), value_residual = maybe_self_attn_value_residual, flash_pack_seq_kwargs = flash_pack_seq_kwargs, return_intermediates = True)
+                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, polar_pos_emb = polar_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, kv_input_residual = next(self_attn_kv_residuals_iter, None), value_residual = maybe_self_attn_value_residual, flash_pack_seq_kwargs = flash_pack_seq_kwargs, return_intermediates = True, causal = causal)
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), kv_input_residual = next(cross_attn_kv_residuals_iter, None), value_residual = maybe_cross_attn_value_residual, **cross_attn_rotary_pos_emb, flash_pack_seq_kwargs = flash_pack_seq_context_kwargs, return_intermediates = True)
             elif layer_type == 'f':
@@ -3042,7 +3189,7 @@ class AttentionLayers(Module):
             if exists(post_branch_norm):
                 out = post_branch_norm(out)
 
-            x = residual_fn(out, inner_residual, **residual_kwargs)
+            x = residual_fn(out, inner_residual, layer_hiddens = layer_hiddens, **residual_kwargs)
 
             if layer_type in ('a', 'c') and return_hiddens:
                 inter.layer_type = layer_type
@@ -3154,7 +3301,8 @@ class AttentionPool(Module):
         use_transformer_blocks = default(use_transformer_blocks, depth > 1)
         assert use_transformer_blocks or depth == 1
 
-        self.queries = nn.Parameter(torch.randn(num_pooled_tokens, dim) * 1e-2)
+        self.has_learned_queries = num_pooled_tokens > 0
+        self.queries = nn.Parameter(torch.randn(num_pooled_tokens, dim) * 1e-2) if self.has_learned_queries else None
 
         if use_transformer_blocks:
             assert not add_residual, 'residual already in effect when doing a full cross attention based transformer for pooling'
@@ -3167,12 +3315,14 @@ class AttentionPool(Module):
         self.add_residual = add_residual
         self.squeeze_output = squeeze_output
 
-    def forward(self, context, mask = None):
+    def forward(self, context, mask = None, queries = None, **kwargs):
         batch = context.shape[0]
 
-        queries = repeat(self.queries, 'n d -> b n d', b = batch)
+        if not exists(queries):
+            assert self.has_learned_queries, 'queries must be passed in if num_pooled_tokens was set to 0 at initialization'
+            queries = repeat(self.queries, 'n d -> b n d', b = batch)
 
-        pooled = self.pooler(queries, context, context_mask = mask)
+        pooled = self.pooler(queries, context, context_mask = mask, **kwargs)
 
         if self.add_residual:
             pooled = pooled + queries

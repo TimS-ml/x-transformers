@@ -1634,3 +1634,53 @@ def test_continuous_transformer_external_projects():
     logits = model(x)
 
     assert logits.shape == (1, 16, 16)
+
+@param('pos_emb_type', ('rotary', 'polar', 'none'))
+@param('qkv_receive_diff_residuals', (False, True))
+@param('last_layer_as_query', (False, True))
+def test_attn_aggregated_residuals(
+    pos_emb_type,
+    qkv_receive_diff_residuals,
+    last_layer_as_query
+):
+
+    kwargs = dict()
+    if pos_emb_type == 'rotary':
+        kwargs = dict(rotary_pos_emb = True)
+    elif pos_emb_type == 'polar':
+        kwargs = dict(polar_pos_emb = True)
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 6,
+            heads = 8,
+            attn_aggregated_residuals = True,
+            qkv_receive_diff_residuals = qkv_receive_diff_residuals,
+            attn_residuals_last_output_as_query = last_layer_as_query,
+            **kwargs
+        )
+    )
+
+    x = torch.randint(0, 256, (2, 128))
+
+    logits = model(x)
+    logits.sum().backward()
+
+def test_causal_override():
+    model = TransformerWrapper(
+        num_tokens = 20000,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 128,
+            depth = 2,
+            heads = 8
+        )
+    )
+
+    x = torch.randint(0, 20000, (2, 1024))
+
+    logits = model(x, causal = False)
+    assert logits.shape == (2, 1024, 20000)
