@@ -20,7 +20,7 @@ from torch.nn import Module, ModuleList, ModuleDict
 
 from loguru import logger
 
-from x_transformers.attend import Attend, Intermediates, pack_one, unpack_one
+from x_transformers.attend import Attend, Intermediates, pack_one, unpack_one, log_prob_from_hard_attend
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 
 import einx
@@ -123,6 +123,83 @@ def Sequential(*modules):
 class Identity(Module):
     def forward(self, t, *args, **kwargs):
         return t
+
+# recurrent depth related
+
+LayerRange = int | tuple[int, int]
+"""A single layer index or a (start, end) inclusive range of block indices."""
+
+RepeatBlockSpec = tuple[LayerRange, int]
+"""A (layer_range, repeat_count) specification for repeating a contiguous block."""
+
+RepeatBlocks = tuple[RepeatBlockSpec, ...] | RepeatBlockSpec
+"""One or more RepeatBlockSpec entries specifying which blocks to repeat."""
+
+
+def resolve_repeat_blocks_to_layer_execute_order(
+    repeat_blocks: RepeatBlocks,
+    num_blocks: int,
+    len_default_block: int
+) -> tuple[int, ...]:
+    """
+    Resolve a repeat-blocks specification into a flat layer execution order.
+
+    Allows arbitrary contiguous blocks of the transformer to be repeated
+    (recurrent depth), enabling depth-extrapolation and recurrent inference
+    without changing model weights.
+
+    Args:
+        repeat_blocks: One or more (layer_range, repeats) specs.
+            - layer_range: int (single block) or (start, end) inclusive block indices.
+            - repeats: How many times to execute the block range.
+        num_blocks: Total number of transformer blocks (depth).
+        len_default_block: Number of layers per block (e.g. 2 for attn+ff).
+
+    Returns:
+        A flat tuple of layer indices in execution order, with repeated blocks
+        expanded in-place.
+
+    Example:
+        # Repeat block 2 (layers 4,5) three times in a 6-block model (12 layers total):
+        repeat_blocks = (2, 3)  # block index 2, execute 3 times total
+        resolve_repeat_blocks_to_layer_execute_order(repeat_blocks, 6, 2)
+        # blocks execute order: [0, 1, 2, 2, 2, 3, 4, 5]
+        # -> (0, 1, 2, 3, 4, 5, 4, 5, 4, 5, 6, 7, 8, 9, 10, 11)
+    """
+    if (
+        isinstance(repeat_blocks, tuple) and
+        len(repeat_blocks) == 2 and
+        isinstance(repeat_blocks[1], int)
+    ):
+        repeat_blocks = (repeat_blocks,)
+
+    repeat_blocks_dict = dict()
+    for start_end, repeats in repeat_blocks:
+        start, end = cast_tuple(start_end, 2)
+        assert start <= end
+        assert start not in repeat_blocks_dict, f'duplicate repeat block start index {start}'
+        repeat_blocks_dict[start] = (end, repeats)
+
+    blocks_execute_order = []
+    curr_block = 0
+
+    while curr_block < num_blocks:
+        if curr_block not in repeat_blocks_dict:
+            blocks_execute_order.append(curr_block)
+            curr_block += 1
+            continue
+
+        end, repeats = repeat_blocks_dict[curr_block]
+        assert end < num_blocks, f'repeat group ends at block {end} which is >= number of blocks {num_blocks}'
+
+        blocks_execute_order.extend([*range(curr_block, end + 1)] * repeats)
+        curr_block = end + 1
+
+    return tuple(
+        layer_ind
+        for block_ind in blocks_execute_order
+        for layer_ind in range(block_ind * len_default_block, (block_ind + 1) * len_default_block)
+    )
 
 # tensor helpers
 
@@ -2656,6 +2733,8 @@ class AttentionLayers(Module):
             layer_types = default_block * depth
             len_default_block = len(default_block)
 
+        self.has_custom_layer_types = exists(custom_layers) or exists(par_ratio) or exists(sandwich_coef)
+        self.len_default_block = len_default_block
         self.layer_types = layer_types
         self.layers_execute_order = default(layers_execute_order, tuple(range(len(layer_types))))
 
@@ -2866,6 +2945,7 @@ class AttentionLayers(Module):
         input_not_include_cache = False,
         cache_age = 1,
         return_hiddens = False,
+        return_gumbel_log_probs = False,   # if True, compute and attach log probs for hard attention choices to each Intermediates
         rotary_pos_emb = None,
         polar_pos_emb = None,
         pos = None,
@@ -2883,6 +2963,7 @@ class AttentionLayers(Module):
         condition = None,
         in_attn_cond = None, # https://arxiv.org/abs/2105.04090
         layers_execute_order: tuple[int, ...] | None = None,
+        repeat_blocks: RepeatBlocks | None = None,   # if set, override layers_execute_order using recurrent depth block repetition
         self_attn_kv_residuals: Tensor | None = None,
         cross_attn_kv_residuals: Tensor | None = None,
         flash_pack_seq_kwargs = None,
@@ -2893,6 +2974,8 @@ class AttentionLayers(Module):
         assert not (exists(condition) ^ self.need_condition), 'condition needs to be passed in if using adaptive layernorm or vice versa'
         assert not (exists(flash_pack_seq_kwargs) and (exists(attn_mask) or exists(mask))), 'attn_mask or mask cannot be used with flash block masking'
         assert not (exists(flash_pack_seq_context_kwargs) and (exists(context_mask))), 'context_mask cannot be used with flash block masking'
+
+        return_hiddens |= return_gumbel_log_probs
 
         # handle seq pos offset if not passed in from wrapper
         # default to 0, but if cache is detected, set appropriate for the relative positional embeddings
@@ -3041,6 +3124,13 @@ class AttentionLayers(Module):
         )
 
         # able to override the layers execution order on forward, for trying to depth extrapolate
+
+        if exists(repeat_blocks):
+            assert not exists(layers_execute_order), 'cannot pass both `repeat_blocks` and `layers_execute_order`'
+            assert not self.has_custom_layer_types, 'repeat_blocks is only supported for standard block layer typing'
+
+            num_blocks = len(self.layer_types) // self.len_default_block
+            layers_execute_order = resolve_repeat_blocks_to_layer_execute_order(repeat_blocks, num_blocks, self.len_default_block)
 
         layers_execute_order = default(layers_execute_order, self.layers_execute_order)
         layer_variables = tuple(tuple(layer_variable[i] for i in layers_execute_order) for layer_variable in layer_variables)
@@ -3223,6 +3313,17 @@ class AttentionLayers(Module):
 
         if not return_hiddens:
             return x
+
+        if return_gumbel_log_probs:
+            for intermeds in intermediates:
+                if (
+                    not exists(intermeds) or
+                    intermeds.layer_type not in ('a', 'c') or
+                    not exists(intermeds.post_softmax_attn)
+                ):
+                    continue
+
+                intermeds.log_probs = log_prob_from_hard_attend(intermeds)
 
         intermediates = LayerIntermediates(
             hiddens = hiddens,

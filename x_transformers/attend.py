@@ -26,6 +26,7 @@ class Intermediates:
     cached_kv:          tuple[Tensor, Tensor] | None = None
     layer_type:         str | None = None
     hybrid_hidden:      Tensor | None = None
+    log_probs:          Tensor | None = None  # log probs for hard (gumbel) attention choices; populated by return_gumbel_log_probs
 
     def to_tuple(self):
         return (self.qk_similarities, self.pre_softmax_attn, self.post_softmax_attn)
@@ -69,7 +70,24 @@ print_once = once(print)
 
 # gumbel softmax attention related
 
-def log_prob_from_hard_attend(intermeds: Intermediates):
+def log_prob_from_hard_attend(intermeds: Intermediates) -> Tensor:
+    """
+    Compute per-position log probabilities for hard (argmax/gumbel) attention choices.
+
+    Given an `Intermediates` object from a hard-attention forward pass, uses
+    `pre_softmax_attn` (raw logits) and `post_softmax_attn` (hard one-hot weights)
+    to extract the log probability of each chosen key position.
+
+    Args:
+        intermeds: Intermediates dataclass containing:
+            - pre_softmax_attn:  (b h i j) raw attention logits
+            - post_softmax_attn: (b h i j) hard one-hot attention weights (from argmax or gumbel straight-through)
+
+    Returns:
+        Tensor of shape (b h i) — log prob of the chosen key for each query position.
+    """
+    assert intermeds.pre_softmax_attn is not None and intermeds.post_softmax_attn is not None, \
+        'pre_softmax_attn and post_softmax_attn must be present for log prob computation'
     log_probs = intermeds.pre_softmax_attn.log_softmax(dim = -1)
 
     one_hot = intermeds.post_softmax_attn.argmax(dim = -1, keepdim = True)
