@@ -26,6 +26,7 @@ from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, pack, unpack
+from torch_einops_utils import masked_mean, pad_at_dim
 
 # einstein notation
 
@@ -53,6 +54,8 @@ class LayerIntermediates:
     memory_tokens:      Tensor | None = None
     logit_entropies:    Tensor | None = None
     logits:             Tensor | None = None
+    exit_logits:        list[Tensor] | None = None
+    all_pred_logits:    list[Tensor] | None = None
     cache_length:       int = 0
 
 LinearNoBias = partial(nn.Linear, bias = False)
@@ -116,6 +119,7 @@ class equals():
         self.val = val
     def __call__(self, x, *args, **kwargs):
         return x == self.val
+
 
 def Sequential(*modules):
     return nn.Sequential(*filter(exists, modules))
@@ -216,25 +220,6 @@ def l2norm(t, groups = 1):
 
 def softclamp(t, value):
     return (t / value).tanh() * value
-
-def masked_mean(t, mask = None, dim = 1):
-    if not exists(mask):
-        return t.mean(dim = dim)
-
-    dims_append = (1,) * (t.ndim - mask.ndim)
-    mask = mask.reshape(*mask.shape, *dims_append)
-
-    num = (t * mask).sum(dim = dim)
-    den = mask.sum(dim = dim).clamp(min = 1.)
-    return num / den
-
-def pad_at_dim(t, pad: tuple[int, int], dim = -1, value = 0.):
-    if pad == (0, 0):
-        return t
-
-    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
-    zeros = ((0, 0) * dims_from_right)
-    return F.pad(t, (*zeros, *pad), value = value)
 
 def or_reduce(masks):
     head, *body = masks
@@ -2480,6 +2465,7 @@ class AttentionLayers(Module):
         macaron = False,
         pre_norm = True,
         pre_norm_has_final_norm = True,
+        pre_and_post_norm = False,
         attn_aggregated_residuals = False,
         attn_residuals_last_output_as_query = False,
         attn_aggregated_residual_kwargs: dict = dict(),
@@ -2597,8 +2583,18 @@ class AttentionLayers(Module):
 
         assert not (not pre_norm and sandwich_norm), 'sandwich norm cannot be used when not using prenorm'
 
+        # pre norm and sandwich norm
+
         self.pre_norm = pre_norm
         self.sandwich_norm = sandwich_norm
+
+        # pre + post norm - keel paper and the recent looped lm (recurrent depth)
+
+        self.pre_and_post_norm = pre_and_post_norm
+
+        if self.pre_and_post_norm:
+            self.pre_norm = True
+            pre_norm_has_final_norm = False
 
         assert at_most_one_of(gate_residual, attn_aggregated_residuals), 'gate_residual and attn_aggregated_residuals are mutually exclusive'
 
@@ -2735,6 +2731,7 @@ class AttentionLayers(Module):
 
         self.has_custom_layer_types = exists(custom_layers) or exists(par_ratio) or exists(sandwich_coef)
         self.len_default_block = len_default_block
+
         self.layer_types = layer_types
         self.layers_execute_order = default(layers_execute_order, tuple(range(len(layer_types))))
 
@@ -2881,7 +2878,7 @@ class AttentionLayers(Module):
 
             pre_branch_norm = norm_fn() if pre_norm else None
             post_branch_norm = norm_fn() if sandwich_norm else None
-            post_main_norm = norm_fn() if not pre_norm else None
+            post_main_norm = norm_fn() if (not pre_norm or self.pre_and_post_norm) else None
 
             norms = ModuleList([
                 pre_branch_norm,
@@ -2968,7 +2965,7 @@ class AttentionLayers(Module):
         cross_attn_kv_residuals: Tensor | None = None,
         flash_pack_seq_kwargs = None,
         flash_pack_seq_context_kwargs = None,
-        causal = None,
+        causal = None
     ):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
         assert not (exists(condition) ^ self.need_condition), 'condition needs to be passed in if using adaptive layernorm or vice versa'
@@ -3554,6 +3551,8 @@ class TransformerWrapper(Module):
         l2norm_embed = False,
         recycling = False,            # from Jumper et al. - Alphafold2
         train_max_recycle_steps = 4,  # saw a benefit for language modeling up to 3 recycling steps, so let's default this to 4
+        looped = False,               # the looped LM from Zhu et al. https://arxiv.org/abs/2510.25741
+        max_looped_steps = 4,         # they faced instability past 4 steps, but could generalize to 5-8 apparently at inference time
         emb_frac_gradient = 1.,       # GLM-130B and Cogview successfully used this, set at 0.1
         attn_z_loss_weight = 1e-4,
         average_pool_embed = False,
@@ -3636,12 +3635,25 @@ class TransformerWrapper(Module):
 
         assert at_most_one_of(average_pool_embed, use_cls_token)
 
-        # maybe recycling
+        # either recycling or looped
+
+        assert at_most_one_of(recycling, looped)
+
+        # maybe recycling recurrent depth - à la alphafold2
 
         self.recycling = recycling
         self.recycled_proj = LinearNoBias(dim, dim) if recycling else None
 
         self.train_max_recycle_steps = train_max_recycle_steps
+
+        # maybe looped lm recurrent depth
+
+        assert not (looped and not attn_layers.pre_and_post_norm), '`pre_and_post_norm` should be turned on for looped lm'
+
+        self.looped = looped
+        self.exit_gate = LinearNoBias(dim, 1) if looped else None
+
+        self.train_max_looped_steps = max_looped_steps
 
         # either cls token or attn pool, but not both
 
@@ -3719,6 +3731,7 @@ class TransformerWrapper(Module):
 
         num_memory_tokens = default(num_memory_tokens, 0)
         self.num_memory_tokens = num_memory_tokens
+
         if num_memory_tokens > 0:
             self.memory_tokens = nn.Parameter(torch.randn(num_memory_tokens, dim))
 
@@ -3770,6 +3783,8 @@ class TransformerWrapper(Module):
         mems = None,
         mem_masks = None,
         recycle_steps = None,
+        looped_steps = None,
+        looped_pred_all_logits = None,
         pos = None,
         prepend_embeds = None,
         prepend_mask = None,
@@ -3923,16 +3938,53 @@ class TransformerWrapper(Module):
             input_not_include_cache = input_not_include_cache
         )
 
-        # attention layers
+        # the attention layers forward
 
-        if not self.recycling:
+        def _attn_layers_forward(inp, **kwargs):
+            return self.attn_layers(inp, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, deep_embeds_and_ids = deep_embed_and_ids, return_hiddens = True, **kwargs)
+
+        # maybe recycling
+
+        if not (self.recycling or self.looped):
             assert not exists(recycle_steps) or recycle_steps == 1, 'you did not train with recycling'
 
             # regular
 
-            attended, intermediates = self.attn_layers(x, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, deep_embeds_and_ids = deep_embed_and_ids, return_hiddens = True, **kwargs)
+            attended, intermediates = _attn_layers_forward(x, **kwargs)
 
-        else:
+        elif self.looped:
+
+            # looped
+
+            looped_steps = default(looped_steps, self.train_max_looped_steps)
+            looped_pred_all_logits = default(looped_pred_all_logits, self.training)
+
+            assert exists(looped_steps) and looped_steps > 0, '`looped_steps` must be provided on forward if looped is turned on and not training'
+
+            all_pred_logits = []
+            exit_logits = []
+
+            for i in range(looped_steps):
+
+                attended, intermediates = _attn_layers_forward(x, **kwargs)
+
+                layer_exit_logits = self.exit_gate(attended)
+
+                exit_logits.append(layer_exit_logits)
+
+                if looped_pred_all_logits:
+                    layer_pred_logits = self.to_logits(attended)
+                    all_pred_logits.append(layer_pred_logits)
+
+                x = attended
+
+            # store for training exit logits
+
+            intermediates.exit_logits = exit_logits
+            intermediates.all_pred_logits = all_pred_logits
+
+        elif self.recycling:
+
             # recycling
 
             recycle_steps = default(recycle_steps, (randrange(self.train_max_recycle_steps) + 1) if self.training else None)
@@ -3947,7 +3999,7 @@ class TransformerWrapper(Module):
                 with context():
                     maybe_recycled = self.recycled_proj(attended.detach()) if not first_step else 0.
 
-                    attended, intermediates = self.attn_layers(x + maybe_recycled, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, return_hiddens = True, **kwargs)
+                    attended, intermediates = _attn_layers_forward(x + maybe_recycled, **kwargs)
 
         x = attended
 

@@ -1702,3 +1702,33 @@ def test_repeat_blocks_multiple():
     # layer hiddens: 1 (input) + 8 * 2 (attn, ff) = 17
     repeat_num_layers = len(intermediates.layer_hiddens)
     assert repeat_num_layers == 17
+
+def test_looped():
+    from x_transformers import Decoder, AutoregressiveWrapper
+
+    decoder = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 32,
+        looped = True,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 2,
+            heads = 4,
+            pre_and_post_norm = True
+        )
+    )
+
+    tokens = torch.randint(1, 256, (1, 10))
+
+    ar_wrapper = AutoregressiveWrapper(
+        decoder,
+        looped_loss_threshold_exit = 0.05
+    )
+
+    loss = ar_wrapper(tokens)
+    loss.backward()
+
+    logits, intermediates = decoder(tokens, return_intermediates = True)
+
+    assert len(intermediates.exit_logits) == 4
+    assert len(intermediates.all_pred_logits) == 4

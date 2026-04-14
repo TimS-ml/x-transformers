@@ -127,7 +127,7 @@ def train(
             heads = 8,
             rotary_pos_emb = False,
             polar_pos_emb = True,
-            attn_aggregated_residuals = True
+            pre_and_post_norm = True
         )
     )
 

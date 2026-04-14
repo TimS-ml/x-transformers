@@ -324,7 +324,8 @@ class SelfMaskedRepTraining(nn.Module):
         # extract student representation at layer l
 
         student_hiddens = student_cache.layer_hiddens
-        student_rep = student_hiddens[self.student_layer]
+        student_idx = get_extraction_index(self.student_layer, self.recurrent_block, student_repeats)
+        student_rep = student_hiddens[student_idx]
 
         # teacher pass with unmasked (cleaner) inputs
 
@@ -334,8 +335,6 @@ class SelfMaskedRepTraining(nn.Module):
         with torch.no_grad():
             teacher_inp = x if self.predict_next_teacher else x[:, :-1]
 
-            # ema wraps TransformerWrapper
-
             _, teacher_cache = self.teacher.ema_model(
                 teacher_inp,
                 return_intermediates = True,
@@ -343,7 +342,8 @@ class SelfMaskedRepTraining(nn.Module):
             )
 
             teacher_hiddens = teacher_cache.layer_hiddens
-            teacher_rep = teacher_hiddens[self.teacher_layer]
+            teacher_idx = get_extraction_index(self.teacher_layer, self.recurrent_block, teacher_repeats)
+            teacher_rep = teacher_hiddens[teacher_idx]
 
         # cosine similarity representation loss
 
@@ -422,7 +422,10 @@ def train(
     use_self_attn_kv_mask = True,
     use_asymmetric_dropout = False,
     student_dropout_rate = 0.,
-    teacher_dropout_rate = 0.
+    teacher_dropout_rate = 0.,
+    teacher_extra_repeats = 1,
+    student_recurrent_block_repeat_max = 3,
+    recurrent_block = None
 ):
     # accelerator
 
@@ -464,7 +467,10 @@ def train(
             use_self_attn_kv_mask = use_self_attn_kv_mask,
             use_asymmetric_dropout = use_asymmetric_dropout,
             student_dropout_rate = student_dropout_rate,
-            teacher_dropout_rate = teacher_dropout_rate
+            teacher_dropout_rate = teacher_dropout_rate,
+            teacher_extra_repeats = teacher_extra_repeats,
+            student_recurrent_block_repeat_max = student_recurrent_block_repeat_max,
+            recurrent_block = recurrent_block
         )
     elif distill_type == 'reverse_kl':
         ssl_wrapper = SelfDistilledTraining(
@@ -475,7 +481,10 @@ def train(
             use_self_attn_kv_mask = use_self_attn_kv_mask,
             use_asymmetric_dropout = use_asymmetric_dropout,
             student_dropout_rate = student_dropout_rate,
-            teacher_dropout_rate = teacher_dropout_rate
+            teacher_dropout_rate = teacher_dropout_rate,
+            teacher_extra_repeats = teacher_extra_repeats,
+            student_recurrent_block_repeat_max = student_recurrent_block_repeat_max,
+            recurrent_block = recurrent_block
         )
 
     ssl_wrapper = accelerator.prepare(ssl_wrapper)

@@ -20,14 +20,14 @@ from math import ceil, log
 from typing import Tuple, Callable
 
 import torch
-from torch import nn, tensor, Tensor
+from torch import nn, tensor, Tensor, stack
 from torch.nn import Module
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from einops import rearrange, repeat, pack, unpack
 
-# Utility helper functions
+from torch_einops_utils import masked_mean, pad_at_dim
 
 def exists(val):
     """
@@ -433,7 +433,10 @@ class AutoregressiveWrapper(Module):
         pad_value = 0,
         mask_prob = 0.,
         add_attn_z_loss = False,
-        next_embed_loss_weight = 0.1
+        next_embed_loss_weight = 0.1,
+        looped_loss_threshold_exit = 0.05,
+        looped_loss_slope = 50,
+        looped_exit_loss_weight = 1.
     ):
         """
         Initialize the AutoregressiveWrapper.
@@ -467,6 +470,12 @@ class AutoregressiveWrapper(Module):
         # Whether to add a continuous embedding prediction loss
         self.add_continuous_pred_head = net.add_continuous_pred_head
         self.next_embed_loss_weight = next_embed_loss_weight
+
+        # looped exit gate training
+
+        self.looped_loss_threshold_exit = looped_loss_threshold_exit
+        self.looped_loss_slope = looped_loss_slope
+        self.looped_exit_loss_weight = looped_exit_loss_weight
 
     @torch.no_grad()
     @eval_decorator
@@ -960,6 +969,7 @@ class AutoregressiveWrapper(Module):
             return_attn_z_loss = add_attn_z_loss,
             return_next_embed_pred = add_next_embed_loss,
             prepend_embeds = prepend_embeds,
+            looped_pred_all_logits = True,
             **kwargs
         )
 
@@ -984,13 +994,79 @@ class AutoregressiveWrapper(Module):
         # Use NLL loss if model outputs log probabilities, otherwise cross-entropy
         loss_fn = F.cross_entropy if not self.net.output_is_log_prob else F.nll_loss
 
-        # Compute cross-entropy loss for next token prediction
-        # Rearrange for PyTorch loss function: (batch, classes, sequence)
-        loss = loss_fn(
-            rearrange(logits, 'b n c -> b c n'),
-            target,
-            ignore_index = ignore_index
-        )
+        # losses - if looped
+
+        if self.net.looped:
+            exit_logits = stack(cache.exit_logits, dim = 1)
+            pred_logits = stack(cache.all_pred_logits, dim = 1)
+
+            exit_logits = exit_logits[..., :-1, :]
+            pred_logits = pred_logits[..., :-1, :]
+
+            exit_logits = rearrange(exit_logits, '... 1 -> ...')
+
+            targets = repeat(target, 'b n -> b l n', l = exit_logits.shape[1])
+            expanded_targets, packed_shape = pack([targets], '*')
+
+            # losses across loops
+
+            losses = loss_fn(
+                rearrange(pred_logits, '... l -> (...) l'),
+                expanded_targets,
+                ignore_index = ignore_index,
+                reduction = 'none'
+            )
+
+            losses, = unpack(losses, packed_shape, '*')
+
+            # the exit loss
+
+            with torch.no_grad():
+                loss_change_per_loop = losses[:, 1:] - losses[:, :-1]
+
+                exit_target = torch.sigmoid(self.looped_loss_slope * (loss_change_per_loop + self.looped_loss_threshold_exit))
+
+            exit_loss = F.binary_cross_entropy_with_logits(
+                exit_logits[:, :-1],
+                exit_target.detach(),
+                reduction = 'none'
+            )
+
+            exit_loss_mask = (targets[:, 1:] != ignore_index)
+
+            exit_loss = exit_loss[exit_loss_mask].mean()
+
+            # exit probs for weighting the loss
+
+            with torch.no_grad():
+                step_exit_logprobs = F.logsigmoid(exit_logits)
+                continue_logprobs = F.logsigmoid(-exit_logits)
+                cum_continue_logprobs = pad_at_dim(continue_logprobs, (1, -1), value = 0., dim = 1).cumsum(dim = 1)
+                exit_probs = (step_exit_logprobs + cum_continue_logprobs).exp()
+
+            # weighted losses
+
+            ignore_mask = targets != ignore_index
+
+            losses = losses * exit_probs.detach()
+
+            loss = masked_mean(losses, ignore_mask)
+
+            # total loss
+
+            loss = (
+                loss +
+                exit_loss * self.looped_exit_loss_weight
+            )
+
+        else:
+            # Compute cross-entropy loss for next token prediction
+            # Rearrange for PyTorch loss function: (batch, classes, sequence)
+            loss = loss_fn(
+                rearrange(logits, 'b n c -> b c n'),
+                target,
+                ignore_index = ignore_index
+            )
 
         # Add attention z-loss if enabled (for training stability)
         if add_attn_z_loss:
