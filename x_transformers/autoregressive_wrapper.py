@@ -705,6 +705,7 @@ class AutoregressiveWrapper(Module):
             alpha = 0.1
         ),
         cache_kv = True,
+        return_intermediates = False,
         **kwargs
     ):
         """
@@ -786,8 +787,14 @@ class AutoregressiveWrapper(Module):
         # Initialize key-value cache for efficient generation
         cache = None
 
-        # Setup contrastive decoding if amateur model(s) provided
-        # Contrastive decoding compares expert (this model) with amateur model(s)
+        # maybe looped
+
+        if self.net.looped:
+            kwargs.update(looped_inference = True)
+
+        # if doing contrastive decoding, turn off filter automatically
+
+
         if exists(amateur_model):
             amateur_model = cast_tuple(amateur_model)
             contrastive_decode_kwargs = cast_tuple(contrastive_decode_kwargs)
@@ -903,7 +910,10 @@ class AutoregressiveWrapper(Module):
         # Unpack to restore original shape (may not have had batch dimension)
         out, = unpack(out, ps, '* n')
 
-        return out
+        if not return_intermediates:
+            return out
+
+        return out, cache
 
     def forward(
         self,
@@ -1041,7 +1051,10 @@ class AutoregressiveWrapper(Module):
             with torch.no_grad():
                 step_exit_logprobs = F.logsigmoid(exit_logits)
                 continue_logprobs = F.logsigmoid(-exit_logits)
+
                 cum_continue_logprobs = pad_at_dim(continue_logprobs, (1, -1), value = 0., dim = 1).cumsum(dim = 1)
+                step_exit_logprobs = pad_at_dim(step_exit_logprobs[:, :-1], (0, 1), value = 0., dim = 1) # last step always exit
+
                 exit_probs = (step_exit_logprobs + cum_continue_logprobs).exp()
 
             # weighted losses

@@ -2,13 +2,13 @@ from __future__ import annotations
 from typing import Callable
 
 import math
-from copy import deepcopy
+from copy import copy, deepcopy
 from random import random, randrange
 from functools import partial, wraps
 from itertools import chain
 from collections import namedtuple
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from packaging import version
 
 import torch
@@ -26,7 +26,7 @@ from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, pack, unpack
-from torch_einops_utils import masked_mean, pad_at_dim
+from torch_einops_utils import masked_mean, pad_at_dim, safe_cat
 
 # einstein notation
 
@@ -42,21 +42,31 @@ DEFAULT_DIM_HEAD = 64
 
 @dataclass
 class LayerIntermediates:
-    hiddens:            list[Tensor] | None = None   # all hiddens, before the final norm (in pre-norm architecture)
-    last_hidden:        Tensor | None = None         # very last hidden after all attention layers, after the final norm
-    attn_intermediates: list[Intermediates] | None = None
-    layer_hiddens:      list[Tensor] | None = None
-    attn_z_loss:        Tensor | None = None
-    mems:               Tensor | None = None
-    last_layer_hiddens: Tensor | None = None
-    initial_embeds:     Tensor | None = None
-    attn_pooled_tokens: Tensor | None = None
-    memory_tokens:      Tensor | None = None
-    logit_entropies:    Tensor | None = None
-    logits:             Tensor | None = None
-    exit_logits:        list[Tensor] | None = None
-    all_pred_logits:    list[Tensor] | None = None
-    cache_length:       int = 0
+    hiddens:                list[Tensor] | None = None   # all hiddens, before the final norm (in pre-norm architecture)
+    last_hidden:            Tensor | None = None         # very last hidden after all attention layers, after the final norm
+    attn_intermediates:     list[Intermediates] | None = None
+    layer_hiddens:          list[Tensor] | None = None
+    attn_z_loss:            Tensor | None = None
+    mems:                   Tensor | None = None
+    last_layer_hiddens:     Tensor | None = None
+    initial_embeds:         Tensor | None = None
+    attn_pooled_tokens:     Tensor | None = None
+    memory_tokens:          Tensor | None = None
+    logit_entropies:        Tensor | None = None
+    logits:                 Tensor | None = None
+    exit_logits:            list[Tensor] | None = None
+    all_pred_logits:        list[Tensor] | None = None
+    exit_indices:           Tensor | None = None
+    looped_prompt_kv_cache: tuple[Tensor, Tensor] | None = None
+    cache_length:           int = 0
+
+    def __copy__(self):
+        out = replace(self)
+
+        if exists(self.attn_intermediates):
+            out.attn_intermediates = [copy(inter) for inter in self.attn_intermediates]
+
+        return out
 
 LinearNoBias = partial(nn.Linear, bias = False)
 
@@ -65,10 +75,11 @@ LinearNoBias = partial(nn.Linear, bias = False)
 def exists(val):
     return val is not None
 
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if callable(d) else d
+def default(*args):
+    for arg in args:
+        if exists(arg):
+            return arg() if callable(arg) else arg
+    return None
 
 def identity(t, *args, **kwargs):
     return t
@@ -3784,7 +3795,10 @@ class TransformerWrapper(Module):
         mem_masks = None,
         recycle_steps = None,
         looped_steps = None,
+        max_looped_steps = None,
         looped_pred_all_logits = None,
+        looped_inference = False,
+        looped_exit_prob_threshold = 0.9,
         pos = None,
         prepend_embeds = None,
         prepend_mask = None,
@@ -3940,48 +3954,132 @@ class TransformerWrapper(Module):
 
         # the attention layers forward
 
-        def _attn_layers_forward(inp, **kwargs):
+        def _attn_layers_forward(inp, cache = None, **kwargs):
             return self.attn_layers(inp, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, deep_embeds_and_ids = deep_embed_and_ids, return_hiddens = True, **kwargs)
 
         # maybe recycling
 
         if not (self.recycling or self.looped):
-            assert not exists(recycle_steps) or recycle_steps == 1, 'you did not train with recycling'
 
             # regular
 
-            attended, intermediates = _attn_layers_forward(x, **kwargs)
+            attended, intermediates = _attn_layers_forward(x, cache = cache, **kwargs)
 
         elif self.looped:
 
             # looped
 
-            looped_steps = default(looped_steps, self.train_max_looped_steps)
+            is_fixed_looped_steps = exists(looped_steps)
+
+            max_looped_steps = default(looped_steps, max_looped_steps, self.train_max_looped_steps)
+
             looped_pred_all_logits = default(looped_pred_all_logits, self.training)
 
-            assert exists(looped_steps) and looped_steps > 0, '`looped_steps` must be provided on forward if looped is turned on and not training'
+            # for looped inference
+
+            cum_exit_prob = 0.
+            cum_continue_logprob = 0.
+
+            # when doing looped inference, detect prompt and handle the kv cache in a special manner
+
+            looped_num_tokens = (n - cache.cache_length) if exists(cache) else n
+            assert not (looped_inference and exists(cache) and looped_num_tokens > 1), 'when doing looped inference, you must decode one token at a time'
+
+            looped_inference_and_is_prompt = looped_inference and not exists(cache) and looped_num_tokens > 1
+
+            # looped training
 
             all_pred_logits = []
             exit_logits = []
 
-            for i in range(looped_steps):
+            # all intermediates gathered for special prompt recurrent kv cache handling
 
-                attended, intermediates = _attn_layers_forward(x, **kwargs)
+            all_intermediates = []
 
-                layer_exit_logits = self.exit_gate(attended)
+            # loop
 
-                exit_logits.append(layer_exit_logits)
+            for i in range(max_looped_steps):
+                is_first = i == 0
+                is_last = i == (max_looped_steps - 1)
 
-                if looped_pred_all_logits:
+                # modify the cache if recurrent prompt kv cache present
+
+                if exists(cache) and exists(cache.looped_prompt_kv_cache):
+                    loop_prompt_kvs = cache.looped_prompt_kv_cache[i]
+                    prompt_kv_len = loop_prompt_kvs[0][0].shape[-2]
+
+                    if is_first:
+                        cache = copy(cache)
+
+                    for attn_intermediate, prompt_kv in zip(cache.attn_intermediates, loop_prompt_kvs):
+                        kv_cache = attn_intermediate.cached_kv
+                        attn_intermediate.cached_kv = tuple(cat((p_kv, kv[..., prompt_kv_len:, :]), dim = -2) for p_kv, kv in zip(prompt_kv, kv_cache))
+
+                # attend
+
+                attended, intermediates = _attn_layers_forward(x, cache = cache, **kwargs)
+
+                # store all intermediates for constructing special prompt kv cache
+
+                all_intermediates.append(intermediates)
+
+                # whether to calculate exit logits
+
+                determine_early_exit = looped_inference and not looped_inference_and_is_prompt and not is_fixed_looped_steps and not is_last
+
+                if not looped_inference or determine_early_exit:
+                    layer_exit_logits = self.exit_gate(attended)
+                    exit_logits.append(layer_exit_logits)
+
+                # whether to pred all logits
+
+                should_early_exit = False
+                should_pred_logits = looped_pred_all_logits
+
+                if determine_early_exit:
+                    exit_logprob = F.logsigmoid(layer_exit_logits)
+                    continue_logprob = F.logsigmoid(-layer_exit_logits)
+
+                    step_exit_prob = (cum_continue_logprob + exit_logprob).exp()
+                    cum_exit_prob += step_exit_prob
+
+                    should_early_exit = cum_exit_prob >= looped_exit_prob_threshold
+
+                    # update for next iteration
+
+                    cum_continue_logprob += continue_logprob
+
+                # predict the logit for this recurrent step
+
+                if should_pred_logits:
                     layer_pred_logits = self.to_logits(attended)
                     all_pred_logits.append(layer_pred_logits)
 
                 x = attended
 
+                # maybe early exit
+
+                if looped_inference and should_early_exit:
+                    break
+
             # store for training exit logits
 
             intermediates.exit_logits = exit_logits
             intermediates.all_pred_logits = all_pred_logits
+
+            # keep track of the exit indices
+
+            prev_exit_indices = cache.exit_indices if exists(cache) else None
+
+            exit_indices = tensor([[i]], device = device) # the last index from for loop above
+            intermediates.exit_indices = safe_cat((prev_exit_indices, exit_indices), dim = -1)
+
+            # specially handle prompt kv cache as in paper
+
+            if looped_inference_and_is_prompt:
+                intermediates.looped_prompt_kv_cache = tuple([attn_inter.cached_kv for attn_inter in inter.attn_intermediates] for inter in all_intermediates)
+            elif exists(cache):
+                intermediates.looped_prompt_kv_cache = cache.looped_prompt_kv_cache
 
         elif self.recycling:
 
@@ -3999,7 +4097,7 @@ class TransformerWrapper(Module):
                 with context():
                     maybe_recycled = self.recycled_proj(attended.detach()) if not first_step else 0.
 
-                    attended, intermediates = _attn_layers_forward(x + maybe_recycled, **kwargs)
+                    attended, intermediates = _attn_layers_forward(x + maybe_recycled, cache = cache, **kwargs)
 
         x = attended
 
@@ -4024,7 +4122,7 @@ class TransformerWrapper(Module):
 
         # store initial embed
 
-        intermediates.initial_embed = init_embed
+        intermediates.initial_embeds = init_embed
 
         # global average pool
 

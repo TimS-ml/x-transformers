@@ -22,6 +22,9 @@ from x_transformers.neo_mlp import (
 
 from x_transformers.multi_input import MultiInputTransformerWrapper
 
+def exists(v):
+    return v is not None
+
 def test_readme():
     model = XTransformer(
         dim = 512,
@@ -1732,3 +1735,28 @@ def test_looped():
 
     assert len(intermediates.exit_logits) == 4
     assert len(intermediates.all_pred_logits) == 4
+
+    token = tokens[:, :1]
+
+    maybe_early_exit_logit, intermediates = decoder(token, max_looped_steps = 5, looped_inference = True, return_intermediates = True)
+    assert maybe_early_exit_logit.shape == (1, 1, 256)
+    assert intermediates.exit_indices < 5
+
+    five_recurrence_logit, intermediates = decoder(token, looped_steps = 5, looped_inference = True, return_intermediates = True)
+    assert five_recurrence_logit.shape == (1, 1, 256)
+    assert intermediates.exit_indices == 4
+
+    # generate with fixed number of loops, say for extrapolation
+
+    sampled, intermediates = ar_wrapper.generate(token, seq_len = 8, max_looped_steps = 5, return_intermediates = True)
+    assert (intermediates.exit_indices < 5).all()
+
+    sampled, intermediates = ar_wrapper.generate(token, seq_len = 8, looped_steps = 5, return_intermediates = True)
+    assert (intermediates.exit_indices == 4).all()
+
+    # with special prompt kv cache handling as in the paper (at each recurrent step, the generated token sees the kv cache of the prompt for that step)
+
+    sampled, intermediates = ar_wrapper.generate(tokens, seq_len = 16, max_looped_steps = 5, return_intermediates = True)
+
+    assert exists(intermediates.looped_prompt_kv_cache)
+    assert (intermediates.exit_indices < 5).all()
