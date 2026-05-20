@@ -939,6 +939,52 @@ model = TransformerWrapper(
 )
 ```
 
+### Orthogonal Residual Updates
+
+https://arxiv.org/abs/2505.11881
+
+Oh et al. propose decomposing each block's output into a component parallel to the residual stream and an orthogonal component, then only adding the orthogonal part back. This yields more stable and efficient deep networks.
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder
+
+model = TransformerWrapper(
+    num_tokens = 20000,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 6,
+        heads = 8,
+        orthog_residual = True
+    )
+)
+```
+
+### Mean-Variance Split Residual Update
+
+https://arxiv.org/abs/2605.06169
+
+Pengqi Lu's mean-variance split residual update, intended to enable very deep (1000-layer) diffusion transformers. Supports a learnt `alpha`/`beta` variant via `residual_fn_kwargs`.
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder
+
+model = TransformerWrapper(
+    num_tokens = 20000,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 6,
+        heads = 8,
+        mv_split_residual = True,
+        pre_and_post_norm = True,
+        residual_fn_kwargs = dict(learned = True)
+    )
+)
+```
+
 ### Rotary Positional Embeddings
 
 <img src="./images/rotary.png" width="500px"></img>
@@ -1520,6 +1566,75 @@ ids_out, num_out, is_number_mask = model.generate(start_ids, start_nums, 17)
 # (1, 17), (1, 17), (1, 17)
 
 # discrete, continuous, mask for discrete / continuous
+```
+
+### Continuous Transformer Autoencoder
+
+A continuous-input transformer autoencoder that compresses a sequence of vectors into a single latent (RL token) and reconstructs the sequence from it. Proposed by Physical Intelligence for compressed state representations in RL fine-tuning. https://www.pi.website/research/rlt
+
+Supports `l1`/`l2` reconstruction losses, deterministic or variational bottlenecks, and variable-length inputs via `lens`.
+
+```python
+import torch
+from x_transformers.continuous_autoencoder import ContinuousTransformerAutoencoder
+
+model = ContinuousTransformerAutoencoder(
+    dim = 512,
+    enc_depth = 4,
+    dec_depth = 4,
+    max_seq_len = 64,
+    dim_latent = 256,
+    bottleneck_type = 'variational',  # or 'deterministic'
+    loss_type = 'l2',                 # or 'l1'
+)
+
+x = torch.randn(2, 64, 512)
+lens = torch.tensor([64, 32])
+
+loss, (recon_loss, aux_loss) = model(x, lens = lens, return_all_losses = True)
+loss.backward()
+
+# encode to latent vector
+latents = model.encode(x, lens = lens)  # (2, 256)
+```
+
+### Variable-Length Autoregressive Training
+
+`AutoregressiveWrapper.forward` accepts a `lens` tensor of true sequence lengths so that padded positions are filled with `ignore_index` and excluded from the loss automatically.
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder, AutoregressiveWrapper
+
+model = AutoregressiveWrapper(
+    TransformerWrapper(
+        num_tokens = 20000,
+        max_seq_len = 1024,
+        attn_layers = Decoder(dim = 512, depth = 6, heads = 8)
+    )
+)
+
+x = torch.randint(0, 20000, (2, 64))
+lens = torch.tensor([64, 40])
+
+loss = model(x, lens = lens)
+loss.backward()
+```
+
+### QKVO Attention Modulation
+
+The `Attention` module accepts optional `q_delta`, `k_delta`, `v_delta`, `o_delta`, and `attn_delta` tensors that are added into the queries, keys, values, output, and attention logits respectively. Useful for adapter-style modulation of attention (https://arxiv.org/abs/2605.12357).
+
+```python
+# inside a custom block, after computing the projection inputs yourself
+out = attention(
+    x,
+    q_delta = q_mod,      # added to q
+    k_delta = k_mod,      # added to k
+    v_delta = v_mod,      # added to v
+    o_delta = o_mod,      # added to merged output
+    attn_delta = a_mod,   # added to attention logits
+)
 ```
 
 ## Citations
@@ -2670,6 +2785,30 @@ ids_out, num_out, is_number_mask = model.generate(start_ids, start_nums, 17)
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2604.12946},
+}
+```
+
+```bibtex
+@misc{oh2026revisitingresidualconnectionsorthogonal,
+    title   = {Revisiting Residual Connections: Orthogonal Updates for Stable and Efficient Deep Networks},
+    author  = {Giyeong Oh and Woohyun Cho and Siyeol Kim and Suhwan Choi and Youngjae Yu},
+    year    = {2026},
+    eprint  = {2505.11881},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2505.11881},
+}
+```
+
+```bibtex
+@misc{lu2026meanmodescreamingmeanvariance,
+    title   = {Mean Mode Screaming: Mean--Variance Split Residuals for 1000-Layer Diffusion Transformers},
+    author  = {Pengqi Lu},
+    year    = {2026},
+    eprint  = {2605.06169},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2605.06169},
 }
 ```
 

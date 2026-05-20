@@ -27,6 +27,7 @@ import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, pack, unpack
 from torch_einops_utils import masked_mean, pad_at_dim, safe_cat
+from torch_einops_utils.nn import Sequential, Lambda, Identity
 
 # einstein notation
 
@@ -132,12 +133,6 @@ class equals():
         return x == self.val
 
 
-def Sequential(*modules):
-    return nn.Sequential(*filter(exists, modules))
-
-class Identity(Module):
-    def forward(self, t, *args, **kwargs):
-        return t
 
 # recurrent depth related
 
@@ -1130,6 +1125,70 @@ class GRUGating(Module):
 
         return gated_output.reshape_as(x)
 
+class OrthogonalResidualUpdate(Module):
+    # Oh et al. https://arxiv.org/abs/2505.11881
+
+    def __init__(
+        self,
+        dim,
+        scale_residual = False,
+        **kwargs
+    ):
+        super().__init__()
+        self.residual_scale = nn.Parameter(torch.ones(dim)) if scale_residual else None
+
+    def prepare(self, residual):
+        return residual, residual, dict()
+
+    def forward(self, x, residual, **kwargs):
+        if exists(self.residual_scale):
+            residual = residual * self.residual_scale
+
+        orthogonal = orthog_project(x, residual)
+
+        return residual + orthogonal
+
+class MVSplitResidualUpdate(Module):
+    # Pengqi Lu https://arxiv.org/abs/2605.06169
+
+    def __init__(
+        self,
+        dim,
+        init_alpha = 0.,
+        init_beta = 0.03,
+        learned = False,
+        **kwargs
+    ):
+        super().__init__()
+        self.learned = learned
+
+        if learned:
+            self.to_alpha = nn.Linear(dim, dim)
+            self.to_beta = nn.Linear(dim, dim)
+
+            nn.init.zeros_(self.to_alpha.weight)
+            nn.init.constant_(self.to_alpha.bias, init_alpha)
+
+            nn.init.zeros_(self.to_beta.weight)
+            nn.init.constant_(self.to_beta.bias, init_beta)
+        else:
+            self.alpha = nn.Parameter(torch.ones(dim) * init_alpha)
+            self.beta = nn.Parameter(torch.ones(dim) * init_beta)
+
+    def prepare(self, residual):
+        return residual, residual, dict()
+
+    def forward(self, x, residual, mask = None, **kwargs):
+        mean_x = masked_mean(x, mask = mask, dim = -2, keepdim = True)
+        mean_residual = masked_mean(residual, mask = mask, dim = -2, keepdim = True)
+
+        alpha = self.to_alpha(mean_x) if self.learned else self.alpha
+        beta = self.to_beta(mean_x) if self.learned else self.beta
+
+        centered_x = x - mean_x
+
+        return residual + centered_x * beta + (mean_x - mean_residual) * alpha
+
 class AttentionAggregatedResidual(Module):
     """
     https://arxiv.org/abs/2601.21582
@@ -1522,15 +1581,29 @@ class GLU(Module):
         dim_in,
         dim_out,
         activation: Callable,
-        mult_bias = False
+        mult_bias = False,
+        softclamp_value = None,
+        gate_softclamp_value = None
     ):
         super().__init__()
         self.act = activation
         self.proj = nn.Linear(dim_in, dim_out * 2)
         self.mult_bias = nn.Parameter(torch.ones(dim_out)) if mult_bias else 1.
 
+        # deepseek v4 softclamping of feedforward
+
+        self.softclamp_value = softclamp_value
+        self.gate_softclamp_value = gate_softclamp_value
+
     def forward(self, x):
         x, gate = self.proj(x).chunk(2, dim = -1)
+
+        if exists(self.softclamp_value):
+            x = softclamp(x, self.softclamp_value)
+
+        if exists(self.gate_softclamp_value):
+            gate = softclamp(gate, self.gate_softclamp_value)
+
         return x * self.act(gate) * self.mult_bias
 
 class FeedForward(Module):
@@ -1550,6 +1623,8 @@ class FeedForward(Module):
         sublayer_dropout = 0.,
         no_bias = False,
         zero_init_output = False,
+        softclamp_value = None,
+        glu_gate_softclamp_value = None,
     ):
         super().__init__()
         inner_dim = int(dim * mult)
@@ -1569,10 +1644,11 @@ class FeedForward(Module):
             activation = nn.GELU()
 
         if glu:
-            proj_in = GLU(dim, inner_dim, activation, mult_bias = glu_mult_bias)
+            proj_in = GLU(dim, inner_dim, activation, mult_bias = glu_mult_bias, softclamp_value = softclamp_value, gate_softclamp_value = glu_gate_softclamp_value)
         else:
-            proj_in = nn.Sequential(
+            proj_in = Sequential(
                 nn.Linear(dim, inner_dim, bias = not no_bias),
+                Lambda(partial(softclamp, value = softclamp_value)) if exists(softclamp_value) else None,
                 activation
             )
 
@@ -2029,6 +2105,11 @@ class Attention(Module):
         additional_key_values: tuple[Tensor, Tensor] | None = None,
         additional_key_value_mask = None,
         kv_input_residual = None,
+        q_delta = None,
+        k_delta = None,
+        v_delta = None,
+        o_delta = None,
+        attn_delta = None,
         flash_pack_seq_kwargs = None,
         causal = None,
     ):
@@ -2094,6 +2175,17 @@ class Attention(Module):
         q = self.to_q(q_input)
         k = self.to_k(k_input)
         v = self.to_v(v_input)
+
+        # allow for modulation, https://arxiv.org/abs/2605.12357
+
+        if exists(q_delta):
+            q = q + q_delta
+
+        if exists(k_delta):
+            k = k + k_delta
+
+        if exists(v_delta):
+            v = v + v_delta
 
         q = self.split_q_heads(q)
         k = self.split_k_heads(k)
@@ -2305,6 +2397,7 @@ class Attention(Module):
             mask = final_attn_mask,
             attn_bias = attn_bias,
             prev_attn = prev_attn,
+            attn_delta = attn_delta,
             flash_pack_seq_kwargs = flash_pack_seq_kwargs,
             causal = causal,
         )
@@ -2382,6 +2475,11 @@ class Attention(Module):
         # merge heads
 
         out = self.merge_heads(out)
+
+        # maybe modulate output
+
+        if exists(o_delta):
+            out = out + o_delta
 
         # alphafold2 styled gating of the values
 
@@ -2481,6 +2579,8 @@ class AttentionLayers(Module):
         attn_residuals_last_output_as_query = False,
         attn_aggregated_residual_kwargs: dict = dict(),
         gate_residual = False,
+        orthog_residual = False,
+        mv_split_residual = False,
         scale_residual = False,
         scale_residual_constant = 1.,
         shift_tokens = 0,
@@ -2541,7 +2641,7 @@ class AttentionLayers(Module):
         self.num_residual_streams = num_residual_streams
         self.stream_emb = nn.Parameter(torch.zeros(num_residual_streams, dim)) if num_residual_streams > 1 else None
 
-        assert not (has_hyper_connections and gate_residual)
+        assert not (has_hyper_connections and (gate_residual or orthog_residual or mv_split_residual))
 
         hyper_conn_produce_diff_views = qkv_receive_diff_residuals and not integrate_layers
 
@@ -2607,7 +2707,7 @@ class AttentionLayers(Module):
             self.pre_norm = True
             pre_norm_has_final_norm = False
 
-        assert at_most_one_of(gate_residual, attn_aggregated_residuals), 'gate_residual and attn_aggregated_residuals are mutually exclusive'
+        assert at_most_one_of(gate_residual, attn_aggregated_residuals, orthog_residual, mv_split_residual), 'gate_residual, attn_aggregated_residuals, orthog_residual, and mv_split_residual are mutually exclusive'
 
         self.residual_attn = residual_attn
         self.cross_residual_attn = cross_residual_attn
@@ -2872,6 +2972,10 @@ class AttentionLayers(Module):
 
             elif gate_residual:
                 residual_fn = GRUGating
+            elif orthog_residual:
+                residual_fn = OrthogonalResidualUpdate
+            elif mv_split_residual:
+                residual_fn = MVSplitResidualUpdate
             else:
                 residual_fn = Residual
 
@@ -3287,7 +3391,7 @@ class AttentionLayers(Module):
             if exists(post_branch_norm):
                 out = post_branch_norm(out)
 
-            x = residual_fn(out, inner_residual, layer_hiddens = layer_hiddens, **residual_kwargs)
+            x = residual_fn(out, inner_residual, layer_hiddens = layer_hiddens, mask = mask, **residual_kwargs)
 
             if layer_type in ('a', 'c') and return_hiddens:
                 inter.layer_type = layer_type

@@ -1760,3 +1760,110 @@ def test_looped():
 
     assert exists(intermediates.looped_prompt_kv_cache)
     assert (intermediates.exit_indices < 5).all()
+
+def test_orthog_residual():
+    from x_transformers import TransformerWrapper, Decoder
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 2,
+            heads = 8,
+            orthog_residual = True
+        )
+    )
+
+    x = torch.randint(0, 256, (1, 10))
+
+    logits = model(x)
+    assert logits.shape == (1, 10, 256)
+
+    loss = logits.sum()
+    loss.backward()
+
+@param('learned', (False, True))
+def test_mv_split_residual(learned):
+    from x_transformers import TransformerWrapper, Decoder
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 2,
+            heads = 8,
+            mv_split_residual = True,
+            pre_and_post_norm = True,
+            residual_fn_kwargs = dict(learned = learned)
+        )
+    )
+
+    x = torch.randint(0, 256, (2, 10))
+    mask = torch.randint(0, 2, (2, 10)).bool()
+
+    logits = model(x, mask = mask)
+    assert logits.shape == (2, 10, 256)
+
+    loss = logits.sum()
+    loss.backward()
+
+def test_softclamp_ff():
+    from x_transformers import TransformerWrapper, Decoder
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 2,
+            heads = 8,
+            ff_glu = True,
+            ff_softclamp_value = 10.,
+            ff_glu_gate_softclamp_value = 10.
+        )
+    )
+
+    x = torch.randint(0, 256, (1, 10))
+
+    logits = model(x)
+    assert logits.shape == (1, 10, 256)
+
+    loss = logits.sum()
+    loss.backward()
+
+@param('loss_type', ('l1', 'l2'))
+@param('has_lens', (False, True))
+@param('bottleneck_type', ('deterministic', 'variational'))
+def test_continuous_autoencoder(
+    loss_type,
+    has_lens,
+    bottleneck_type
+):
+    from x_transformers.continuous_autoencoder import ContinuousTransformerAutoencoder
+
+    model = ContinuousTransformerAutoencoder(
+        dim = 512,
+        enc_depth = 2,
+        dec_depth = 2,
+        max_seq_len = 64,
+        dim_latent = 256,
+        bottleneck_type = bottleneck_type,
+        loss_type = loss_type,
+        deterministic_bottleneck_kwargs = dict(activation = nn.Tanh())
+    )
+
+    x = torch.randn(2, 64, 512)
+    lens = torch.tensor([64, 32]) if has_lens else None
+
+    loss, (recon_loss, aux_loss) = model(x, lens = lens, return_all_losses = True)
+    loss.backward()
+
+    assert recon_loss.ndim == 0
+
+    # getting latents
+
+    latents = model.encode(x, lens = lens)
+
+    assert latents.shape == (2, 256)

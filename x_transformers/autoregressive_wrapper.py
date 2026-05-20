@@ -27,7 +27,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from einops import rearrange, repeat, pack, unpack
 
-from torch_einops_utils import masked_mean, pad_at_dim
+from torch_einops_utils import masked_mean, pad_at_dim, lens_to_mask
 
 def exists(val):
     """
@@ -920,6 +920,7 @@ class AutoregressiveWrapper(Module):
         x,
         return_outputs = False,
         prepend_embeds = None,
+        lens = None,
         **kwargs
     ):
         """
@@ -937,6 +938,9 @@ class AutoregressiveWrapper(Module):
                           If False, return only loss (default: False)
             prepend_embeds: Optional embeddings to prepend to the sequence
                           (e.g., for prefix tuning) (default: None)
+            lens: Optional 1D tensor of true sequence lengths (batch,) used to
+                  mask padded positions so they contribute `ignore_index` to the
+                  loss (default: None)
             **kwargs: Additional arguments passed to the model (e.g., self_attn_kv_mask)
 
         Returns:
@@ -949,6 +953,12 @@ class AutoregressiveWrapper(Module):
                 - cache: Intermediate cache from the model
         """
         seq, ignore_index, add_attn_z_loss, add_next_embed_loss = x.shape[1], self.ignore_index, self.add_attn_z_loss, self.add_continuous_pred_head
+
+        # if lens for sequences passed in, set padding to `ignore_index`
+        # so that loss is ignored at padded positions
+        if exists(lens):
+            mask = lens_to_mask(lens, seq)
+            x = x.masked_fill(~mask, ignore_index)
 
         # Setup input and target
         # Target is the input shifted by one position (next token prediction)
