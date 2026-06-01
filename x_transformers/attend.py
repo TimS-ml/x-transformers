@@ -19,6 +19,23 @@ from einops import rearrange, repeat, pack, unpack
 
 @dataclass
 class Intermediates:
+    """
+    Container for per-layer attention intermediates, returned alongside the
+    attention output. Lets downstream code inspect / cache attention internals
+    (for analysis, residual attention, kv caching, hybrid layers, etc).
+
+    Fields:
+        qk_similarities:   raw query-key similarity scores (post scale, pre mask/softmax).
+        pre_softmax_attn:  attention logits right before the attn_fn (post mask, sink, cope...).
+        post_softmax_attn: attention weights right after the attn_fn (the actual mixing weights).
+        values:            the value tensor used in the weighted sum (when stashed).
+        cached_kv:         (key, value) pair stashed for incremental kv-cache decoding.
+                           NOTE: declared here, but actually produced and consumed in
+                           Attention.forward (x_transformers.py) — Attend never sets it.
+        layer_type:        single-char tag for the layer ('a' = attention) used by cache logic.
+        hybrid_hidden:     hidden state from a hybrid (e.g. recurrent/conv) branch, if present.
+        log_probs:         log probs for hard (gumbel) attention choices; populated by return_gumbel_log_probs.
+    """
     qk_similarities:    Tensor | None = None
     pre_softmax_attn:   Tensor | None = None
     post_softmax_attn:  Tensor | None = None
@@ -29,6 +46,7 @@ class Intermediates:
     log_probs:          Tensor | None = None  # log probs for hard (gumbel) attention choices; populated by return_gumbel_log_probs
 
     def to_tuple(self):
+        # legacy 3-tuple view (qk sims, pre-softmax, post-softmax) for older callers
         return (self.qk_similarities, self.pre_softmax_attn, self.post_softmax_attn)
 
 # helpers
@@ -183,6 +201,23 @@ def onnx_create_causal_mask(i, j, device):
 # main class
 
 class Attend(Module):
+    """
+    The core attention compute, decoupled from projections / heads (those live in
+    Attention in x_transformers.py). Given q, k, v it returns the attended output
+    plus an Intermediates bundle.
+
+    Two code paths:
+      - flash (`flash_attn`): delegates to F.scaled_dot_product_attention under an
+        sdp backend context manager. Fast, but only supports a limited feature set
+        (no sigmoid/hard/topk/cog/selective/talking-heads/softclamp/residual attn).
+      - manual (`forward` fallback): explicit einsum + softmax pipeline that supports
+        all the bells and whistles (talking heads, softclamp, cope, selective attn,
+        learned sink, alternative attn_fns, residual/delta attention, cog signs, ...).
+
+    The constructor wires up which features are active and asserts the
+    incompatible-with-flash combinations up front.
+    """
+
     def __init__(
         self,
         *,
@@ -358,6 +393,17 @@ class Attend(Module):
         flash_pack_seq_kwargs = None, # https://github.com/Dao-AILab/flash-attention/blob/v2.8.3/flash_attn/flash_attn_interface.py#L1370
         causal = None,
     ):
+        """
+        Flash attention path: dispatch to a fused SDPA kernel.
+
+        Handles the bookkeeping that the manual path does inline: expanding
+        multi-query k/v to full heads, folding the l2-distance trick into q/k,
+        rescaling for cosine-sim attention, building/merging masks (key padding +
+        causal), turning an alibi bias into an additive mask, and zeroing rows that
+        end up fully masked. Either calls the variable-length packed flash kernel
+        (`flash_attn_varlen_func`) or `F.scaled_dot_product_attention` under the sdp
+        backend context manager. Returns (out, empty Intermediates).
+        """
         batch, heads, q_len, _, k_len, is_cuda, device = *q.shape, k.shape[-2], q.is_cuda, q.device
 
         # Recommended for multi-query single-key-value attention by Tri Dao
@@ -496,6 +542,9 @@ class Attend(Module):
         causal = None,
     ):
         """
+        Main entry point. Routes to the flash path when possible, otherwise runs
+        the manual attention pipeline below (the part that supports every feature).
+
         einstein notation
         b - batch
         h - heads
@@ -537,33 +586,45 @@ class Attend(Module):
             if exists(attn_bias):
                 attn_bias = F.pad(attn_bias, (1, 0), value = 0.)
 
+        # take the flash path only when no per-element attn_delta is requested
+        # (flash returns weights implicitly, so it can't have a delta added post-softmax)
+
         if self.flash and not exists(attn_delta):
             assert not exists(prev_attn), 'residual attention not compatible with flash attention'
             return self.flash_attn(q, k, v, mask = mask, attn_bias = attn_bias, flash_pack_seq_kwargs = flash_pack_seq_kwargs)
 
+        # einsum equation differs depending on whether k/v are shared across heads (3d) or per-head (4d)
         kv_einsum_eq = 'b j d' if k.ndim == 3 else 'b h j d'
 
+        # similarity: standard dot-product, or negative squared l2 distance as an alternative metric
         if not self.l2_distance:
             sim = einsum(f'b h i d, {kv_einsum_eq} -> b h i j', q, k)
         else:
             sim = -qk_l2_dist_squared(q, k)
 
+        # scale logits (1/sqrt(d) by default, or custom for cosine-sim attention)
         sim = sim * scale
 
+        # residual attention - add previous layer's pre-softmax logits (RealFormer style)
         if exists(prev_attn):
             sim = sim + prev_attn
 
         qk_similarities = sim.clone()
 
+        # talking-heads: mix information across heads via 1x1 convs over the head dim
+        # pre_scale variant: compute a per-head scale now, apply it post-softmax
         if exists(self.pre_scale_post_talking_heads):
             pre_to_post_scale = self.pre_scale_post_talking_heads(sim)
 
+        # pre-softmax talking heads: mix heads before the softmax
         if exists(self.pre_softmax_talking_heads):
             sim = sim + self.pre_softmax_talking_heads(sim)
 
+        # additive positional bias (e.g. alibi / relative position)
         if exists(attn_bias):
             sim = sim + attn_bias
 
+        # soft-clamp logits into (-value, value) via tanh, to bound outlier logits
         if self.softclamp_logits:
             sim = softclamp(sim, self.logit_softclamp_value)
 
@@ -573,32 +634,38 @@ class Attend(Module):
             sim_sign = sim.sign()
             sim = sim.abs()
 
-        # masking
+        # masking - fill disallowed positions with a very negative value so they vanish after softmax
 
         i, j, dtype = *sim.shape[-2:], sim.dtype
 
         mask_value = -torch.finfo(sim.dtype).max
 
+        # key padding / custom mask
         if exists(mask):
             sim = sim.masked_fill(~mask, mask_value)
 
+        # causal mask - forbid attending to future positions
         if causal:
             causal_mask = self.create_causal_mask(i, j, device = device)
             sim = sim.masked_fill(causal_mask, mask_value)
 
+        # track rows with nothing left to attend to, so their output can be zeroed later
         row_is_entirely_masked = None
 
         if exists(mask):
             row_is_entirely_masked = ~mask.any(dim = -1)
 
+        # CoPE - contextual positional encoding, adds a content-conditioned position bias
         if exists(self.cope):
             sim = sim + self.cope(q, sim)
 
+        # selective attention - let tokens suppress being attended to by future tokens
         if self.selective:
             sim = selective_attn(sim)
 
         if self.head_learned_sink:
-            # add learned attention sink
+            # learned attention sink: prepend a per-head learnable logit column, giving the
+            # softmax an always-present "attend to nothing" option (absorbs leftover mass)
             attn_sink = repeat(self.head_attn_sink, 'h -> b h i 1', b = sim.shape[0], i = sim.shape[2])
 
             if self.cog_signed:
@@ -609,16 +676,20 @@ class Attend(Module):
 
         pre_softmax_attn = sim
 
+        # turn logits into attention weights. attn_fn was selected in __init__ and is one of:
+        # softmax (default) / sigmoid / hard one-hot straight-through / sparse-topk /
+        # gumbel-softmax / custom — see the constructor.
         attn = self.attn_fn(sim)
 
         attn = attn.type(dtype)
 
+        # post-softmax additive correction to the attention weights
         # https://openreview.net/forum?id=uomCTwGflg
 
         if exists(attn_delta):
             attn = attn + attn_delta
 
-        # add back the sign
+        # cog attention: restore the signs stripped before softmax (allows negative weights)
 
         if self.cog_signed:
             attn = attn * sim_sign
@@ -626,17 +697,21 @@ class Attend(Module):
         post_softmax_attn = attn
 
         if self.head_learned_sink:
-            # remove attention sink
+            # drop the sink column so it doesn't contribute to the value-weighted sum
             attn = attn[..., 1:]
 
+        # attention dropout
         attn = self.attn_dropout(attn)
 
+        # post-softmax talking heads: mix the attention weights across heads
         if exists(self.post_softmax_talking_heads):
             attn = self.post_softmax_talking_heads(attn)
 
+        # apply the per-head scale computed pre-softmax (pre_scale_post variant)
         if exists(self.pre_scale_post_talking_heads):
             attn = attn * pre_to_post_scale
 
+        # weighted sum of values by attention weights -> attended output
         out = einsum(f'b h i j, {kv_einsum_eq} -> b h i d', attn, v)
 
         intermediates = Intermediates(

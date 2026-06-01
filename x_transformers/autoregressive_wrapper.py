@@ -450,6 +450,11 @@ class AutoregressiveWrapper(Module):
                       Paper: https://arxiv.org/abs/2210.13432
             add_attn_z_loss: Whether to add attention z-loss for stability (default: False)
             next_embed_loss_weight: Weight for continuous embedding prediction loss (default: 0.1)
+            looped_loss_threshold_exit: improvement threshold below which the exit gate
+                      should fire, for the looped-LM exit-gate training target (default: 0.05)
+            looped_loss_slope: steepness of the sigmoid mapping Δloss -> exit target;
+                      larger = harder step around the threshold (default: 50)
+            looped_exit_loss_weight: weight of the exit-gate BCE loss in the total loss (default: 1.)
         """
         super().__init__()
         self.pad_value = pad_value
@@ -788,6 +793,8 @@ class AutoregressiveWrapper(Module):
         cache = None
 
         # maybe looped
+        # for a looped LM, tell the net to run inference-time looping (it will use its
+        # learned exit gate to decide how many loops to run per step)
 
         if self.net.looped:
             kwargs.update(looped_inference = True)
@@ -1015,20 +1022,27 @@ class AutoregressiveWrapper(Module):
         loss_fn = F.cross_entropy if not self.net.output_is_log_prob else F.nll_loss
 
         # losses - if looped
+        # for a looped / universal-transformer style LM, the net runs the block L times
+        # and at each loop emits (a) next-token logits and (b) an "exit" gate logit deciding
+        # whether to stop looping. we train the per-loop prediction AND the exit gate.
 
         if self.net.looped:
+            # stack per-loop outputs along a new loop axis l: exit gate logits and prediction logits
             exit_logits = stack(cache.exit_logits, dim = 1)
             pred_logits = stack(cache.all_pred_logits, dim = 1)
 
+            # drop the last token position (no target for it), as in the non-looped path
             exit_logits = exit_logits[..., :-1, :]
             pred_logits = pred_logits[..., :-1, :]
 
+            # exit gate is a single scalar per position - squeeze the trailing 1 dim
             exit_logits = rearrange(exit_logits, '... 1 -> ...')
 
+            # broadcast the next-token targets across the loop axis (same target every loop)
             targets = repeat(target, 'b n -> b l n', l = exit_logits.shape[1])
             expanded_targets, packed_shape = pack([targets], '*')
 
-            # losses across loops
+            # per-loop cross-entropy (unreduced) - one CE value per (batch, loop, position)
 
             losses = loss_fn(
                 rearrange(pred_logits, '... l -> (...) l'),
@@ -1040,12 +1054,16 @@ class AutoregressiveWrapper(Module):
             losses, = unpack(losses, packed_shape, '*')
 
             # the exit loss
+            # target for the exit gate is derived from how much the CE improves from one loop
+            # to the next: if the loss stops dropping (Δloss >= -threshold), we should exit.
+            # sigmoid(slope * (Δloss + threshold)) is a soft step -> ~1 when little/no improvement.
 
             with torch.no_grad():
                 loss_change_per_loop = losses[:, 1:] - losses[:, :-1]
 
                 exit_target = torch.sigmoid(self.looped_loss_slope * (loss_change_per_loop + self.looped_loss_threshold_exit))
 
+            # BCE between predicted exit gate (logits) and the derived soft exit target
             exit_loss = F.binary_cross_entropy_with_logits(
                 exit_logits[:, :-1],
                 exit_target.detach(),
@@ -1057,17 +1075,22 @@ class AutoregressiveWrapper(Module):
             exit_loss = exit_loss[exit_loss_mask].mean()
 
             # exit probs for weighting the loss
+            # convert per-loop exit gates into the probability that the model actually
+            # exits AT loop l = P(exit at l) * prod_{<l} P(continue), computed in log space.
 
             with torch.no_grad():
-                step_exit_logprobs = F.logsigmoid(exit_logits)
-                continue_logprobs = F.logsigmoid(-exit_logits)
+                step_exit_logprobs = F.logsigmoid(exit_logits)      # log P(exit) at each loop
+                continue_logprobs = F.logsigmoid(-exit_logits)      # log P(continue) at each loop
 
+                # cumulative log-prob of having continued through all earlier loops
                 cum_continue_logprobs = pad_at_dim(continue_logprobs, (1, -1), value = 0., dim = 1).cumsum(dim = 1)
                 step_exit_logprobs = pad_at_dim(step_exit_logprobs[:, :-1], (0, 1), value = 0., dim = 1) # last step always exit
 
                 exit_probs = (step_exit_logprobs + cum_continue_logprobs).exp()
 
             # weighted losses
+            # weight each loop's CE by the probability the model exits at that loop, so loops
+            # the model is unlikely to use contribute less to the final LM loss
 
             ignore_mask = targets != ignore_index
 
@@ -1075,7 +1098,7 @@ class AutoregressiveWrapper(Module):
 
             loss = masked_mean(losses, ignore_mask)
 
-            # total loss
+            # total loss = exit-weighted LM loss + weighted exit-gate BCE loss
 
             loss = (
                 loss +
