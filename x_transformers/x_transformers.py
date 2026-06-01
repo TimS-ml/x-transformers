@@ -499,7 +499,13 @@ class RelativePositionBias(Module):
 
 class CoPE(Module):
     """
-    Appendix B of https://arxiv.org/abs/2405.18719
+    Contextual Position Encoding (CoPE) - https://arxiv.org/abs/2405.18719 (Appendix B)
+
+    Unlike fixed token-index positions, CoPE counts position *contextually*: a learned
+    gate decides which previous tokens "count", so position becomes a cumulative sum of
+    gates rather than 1,2,3,... This yields fractional positions, which are interpolated
+    between learned integer position embeddings (or softly one-hotted) to add a bias to
+    the attention logits.
     """
     def __init__ (
         self,
@@ -535,11 +541,13 @@ class CoPE(Module):
 
         # compute positions
 
-        gates = attn_logits.sigmoid()
+        gates = attn_logits.sigmoid()  # per key, how much it counts toward position
 
+        # contextual position = reverse-cumulative count of gates (fractional)
         pos = gates.flip(-1).cumsum(dim = -1).flip(-1)
         pos = pos.clamp(max = self.max_pos - 1)
 
+        # similarity of query against each learned integer position embedding
         logits_int = einsum('b h n d, p d -> b h n p', query, self.pos_emb)
 
         if self.soft_onehot:
@@ -681,7 +689,16 @@ class AlibiPositionalBias(Module):
         return self.bias
 
 class DataDependentAlibi(Module):
-    """ https://openreview.net/forum?id=q2Lnyegkr8 """
+    """
+    Data-dependent ALiBi from the Forgetting Transformer.
+    https://openreview.net/forum?id=q2Lnyegkr8
+
+    Replaces ALiBi's fixed per-head distance slopes with a learned, content-dependent
+    "forget gate" per token (in log space via LogSigmoid). The bias between positions i
+    and j is the cumulative sum of log forget-gates between them, so attention decays by
+    a data-driven amount instead of a static slope. Bidirectional case derives a second
+    set of gates for the upper triangle.
+    """
 
     def __init__(
         self,
@@ -709,13 +726,14 @@ class DataDependentAlibi(Module):
     def forward(self, x):
         bidirectional = not self.causal
 
-        forget_gates = self.to_forget_gates(x) * self.post_log_scale
+        forget_gates = self.to_forget_gates(x) * self.post_log_scale  # log-space forget gate per token
 
-        forget_gates = forget_gates.cumsum(dim = -1)
+        forget_gates = forget_gates.cumsum(dim = -1)  # running log-decay along sequence
 
         if bidirectional:
             forget_gates, forget_gates_reversed = forget_gates.chunk(2, dim = 1)
 
+        # bias(i, j) = cumulative log-decay between positions i and j
         forget_gates = einx.subtract('b h i, b h j -> b h i j', forget_gates, forget_gates)
 
         if bidirectional:
@@ -726,6 +744,7 @@ class DataDependentAlibi(Module):
 
 class PerRowDataDependentAlibi(Module):
     """ same as data dependent alibi from forgetting transformer, but the forgetting gates are also derived by a queries and keys with a small head dimension """
+    # i.e. forget gate between i and j depends on both endpoints (a tiny low-dim attention) rather than a single per-token scalar
 
     def __init__(
         self,
@@ -751,6 +770,7 @@ class PerRowDataDependentAlibi(Module):
 
     def forward(self, x):
         q, k = self.to_forget_gates(x)
+        # pairwise gate logits from tiny per-row query/key, then log-sigmoid -> log-space gate
         forget_gates = einsum('... i d, ... j d -> ... i j', q, k) * self.scale
 
         forget_gates = F.logsigmoid(forget_gates) * self.post_log_scale
@@ -855,7 +875,15 @@ def apply_rotary_pos_emb(t, freqs, scale = 1):
     return out.type(orig_dtype)
 
 class PolarEmbedding(Module):
-    """ https://arxiv.org/abs/2509.10534 """
+    """
+    Polar Position Embedding (PoPE) - https://arxiv.org/abs/2509.10534
+
+    A rotary-style positional scheme where each feature pair is placed in polar
+    coordinates: the (softplus'd, positive) feature magnitude is the radius and the
+    position determines the angle (`freqs`). A per-head `learned_bias` adds a constant
+    phase offset. Unlike RoPE it doubles the feature dim (cos and sin branches) rather
+    than rotating in place.
+    """
 
     def __init__(
         self,
@@ -880,9 +908,9 @@ class PolarEmbedding(Module):
         if t.ndim == 1:
             t = rearrange(t, 'n -> 1 n')
 
-        freqs = torch.einsum('b i , j -> b i j', t.type_as(self.inv_freq), self.inv_freq)
+        freqs = torch.einsum('b i , j -> b i j', t.type_as(self.inv_freq), self.inv_freq)  # angle = position * inv_freq
 
-        bias = self.learned_bias.clamp(-2. * math.pi, 0.)
+        bias = self.learned_bias.clamp(-2. * math.pi, 0.)  # per-head phase offset in [-2pi, 0]
 
         return freqs, bias
 
@@ -893,8 +921,8 @@ def apply_polar_pos_emb(t, freqs):
 
     t = t.float()
 
-    t = F.softplus(t)
-    out = cat((t * freqs.cos(), t * freqs.sin()), dim = -1)
+    t = F.softplus(t)  # positive radius (magnitude)
+    out = cat((t * freqs.cos(), t * freqs.sin()), dim = -1)  # polar -> cartesian, doubling the feature dim
 
     return out.type(orig_dtype)
 
@@ -1034,7 +1062,15 @@ class MultiheadRMSNorm(Module):
         return self.rmsnorm(x) * (self.gamma + 1.)
 
 class DynamicTanh(Module):
-    """ https://arxiv.org/abs/2503.10622 """
+    """
+    Dynamic Tanh (DyT) - a norm-free drop-in replacement for LayerNorm/RMSNorm.
+    https://arxiv.org/abs/2503.10622
+
+    Instead of normalizing by statistics, it squashes activations with a learned
+    tanh `gamma * tanh(alpha * x) + beta`, where alpha (pre_tanh_scale) controls
+    saturation. `unit_offset` re-parameterizes the params around 1 so they start
+    near identity (helps weight-decay / init stability).
+    """
     def __init__(
         self,
         dim,
@@ -1058,10 +1094,18 @@ class DynamicTanh(Module):
     def forward(self, x):
         pre_tanh_scale = self.pre_tanh_scale + self.pre_tanh_scale_offset
         gamma = self.gamma + self.gamma_offset
-        return (x * pre_tanh_scale).tanh() * gamma + self.beta
+        return (x * pre_tanh_scale).tanh() * gamma + self.beta  # gamma * tanh(alpha * x) + beta
 
 class Derf(Module):
-    """ https://arxiv.org/abs/2512.10938 """
+    """
+    Derf - norm-free normalization using the erf (gaussian error function) as the
+    squashing nonlinearity instead of tanh.
+    https://arxiv.org/abs/2512.10938
+
+    Same shape as DynamicTanh (`gamma * erf(alpha * x + s) + beta`); erf saturates
+    a touch sharper than tanh. `unit_offset` shifts the learned scales so they
+    initialize near identity.
+    """
     def __init__(
         self,
         dim,
@@ -1081,9 +1125,9 @@ class Derf(Module):
         self.scale_offset = scale_offset
 
     def forward(self, x):
-        x = x * (self.alpha + self.scale_offset) + self.s
+        x = x * (self.alpha + self.scale_offset) + self.s  # affine pre-erf: alpha * x + s
         activated = torch.erf(x)
-        return activated * (self.gamma + self.scale_offset) + self.beta
+        return activated * (self.gamma + self.scale_offset) + self.beta  # per-dim gamma/beta
 
 # residual and residual gates
 
@@ -1126,7 +1170,18 @@ class GRUGating(Module):
         return gated_output.reshape_as(x)
 
 class OrthogonalResidualUpdate(Module):
-    # Oh et al. https://arxiv.org/abs/2505.11881
+    """
+    Orthogonal residual update - Oh et al. https://arxiv.org/abs/2505.11881
+
+    Only adds back the component of the branch output `x` that is orthogonal to the
+    residual stream. This stops the branch from merely rescaling existing features
+    (which carries no new info) and forces it to write genuinely new directions.
+
+    Residual-update modules share a common interface used by AttentionLayers:
+      prepare(residual)  -> (branch_input, residual, extra_kwargs)  # what the
+                            block consumes as input + state to add back later
+      forward(x, residual, **extra)  -> updated residual stream
+    """
 
     def __init__(
         self,
@@ -1144,12 +1199,19 @@ class OrthogonalResidualUpdate(Module):
         if exists(self.residual_scale):
             residual = residual * self.residual_scale
 
-        orthogonal = orthog_project(x, residual)
+        orthogonal = orthog_project(x, residual)  # strip the component of x parallel to residual
 
         return residual + orthogonal
 
 class MVSplitResidualUpdate(Module):
-    # Pengqi Lu https://arxiv.org/abs/2605.06169
+    """
+    Mean-Variance split residual update - Pengqi Lu https://arxiv.org/abs/2605.06169
+
+    Splits the branch output into its mean (low-frequency / DC) and its centered
+    (variance / high-frequency) parts and scales them independently: beta gates the
+    fluctuating part while alpha gates how much of the mean shift is applied. Scales
+    may be fixed parameters or predicted per-token (`learned`).
+    """
 
     def __init__(
         self,
@@ -1179,18 +1241,26 @@ class MVSplitResidualUpdate(Module):
         return residual, residual, dict()
 
     def forward(self, x, residual, mask = None, **kwargs):
-        mean_x = masked_mean(x, mask = mask, dim = -2, keepdim = True)
+        mean_x = masked_mean(x, mask = mask, dim = -2, keepdim = True)             # branch DC component (over sequence)
         mean_residual = masked_mean(residual, mask = mask, dim = -2, keepdim = True)
 
         alpha = self.to_alpha(mean_x) if self.learned else self.alpha
         beta = self.to_beta(mean_x) if self.learned else self.beta
 
-        centered_x = x - mean_x
+        centered_x = x - mean_x                                                    # variance / AC component
 
+        # residual + beta * (high-freq part) + alpha * (shift in means)
         return residual + centered_x * beta + (mean_x - mean_residual) * alpha
 
 class AttentionAggregatedResidual(Module):
     """
+    Attention-aggregated residual - instead of taking the residual as just the
+    previous layer's output, an attention-pool gathers information across ALL prior
+    layer hiddens (per token position) to form the residual to add back. The current
+    hiddens `x` can be projected into the queries (`last_layer_hiddens_as_query`),
+    and rotary/polar positional embeddings encode the *layer-depth distance* so the
+    pool is aware of how far back each hidden came from. `num_views` lets it produce
+    several aggregated residuals.
     https://arxiv.org/abs/2601.21582
     https://arxiv.org/abs/2603.15031
     """
@@ -1306,6 +1376,24 @@ def sinkhorn(t, iters = 20):
     return t.to(dtype)
 
 class HyperConnection(Module):
+    """
+    Hyper-Connections - https://arxiv.org/abs/2409.19606
+
+    Generalizes the single residual stream into `num_residual_streams` parallel
+    streams. Each block reads a learned (depth-and-content dependent) mixture of the
+    streams as its input, and writes its output back into the streams via another
+    learned mixture - replacing the fixed `x = x + block(x)` with trainable width +
+    depth connections.
+
+    Interface (same as other residual-update modules):
+      prepare(residuals) -> (branch_input, residuals, dict(beta=...))
+        `alpha` mixes streams -> branch_input + reshuffled residual streams
+      forward(x, residuals, beta) -> streams updated by beta-weighted broadcast of x
+
+    `static_*` are the depth-dependent base mixing weights; `dynamic_*` add a small
+    content-dependent correction. Sinkhorn keeps the residual mixing matrix doubly
+    stochastic ("manifold constrained", https://arxiv.org/abs/2512.24880).
+    """
     def __init__(
         self,
         dim,
@@ -1351,10 +1439,12 @@ class HyperConnection(Module):
         views = self.num_input_views
         streams = self.num_residual_streams
 
+        # streams are packed into the batch dim; unpack to an explicit s axis
         residuals = rearrange(residuals, '(b s) n d -> b n s d', s = self.num_residual_streams)
 
         normed = self.norm(residuals)
 
+        # alpha = static (depth) base + small content-dependent dynamic correction
         wc_weight = normed @ self.dynamic_alpha_fn
         dynamic_alpha = wc_weight * self.dynamic_alpha_scale
         alpha = dynamic_alpha + self.static_alpha
@@ -1390,8 +1480,9 @@ class HyperConnection(Module):
         return branch_input, residuals, dict(beta = beta)
 
     def forward(self, x, residuals, *, beta, **kwargs):
+        # depth-connection: broadcast block output x into every stream, weighted by beta
         residuals = einsum('b n d, b n s -> b n s d', x, beta) + residuals
-        return rearrange(residuals, 'b n s d -> (b s) n d')
+        return rearrange(residuals, 'b n s d -> (b s) n d')  # re-pack streams into batch
 
 # LIMe - layer integrated memory (dynamic version)
 
@@ -1576,6 +1667,11 @@ class ConcatCombine(Module):
 # feedforward
 
 class GLU(Module):
+    """
+    Gated Linear Unit - projects to 2x width, splits into a value and a gate, and
+    multiplies value by activation(gate). With swish this is the SwiGLU used in most
+    modern transformers. `mult_bias` is an optional learned per-channel multiplier.
+    """
     def __init__(
         self,
         dim_in,
@@ -1587,26 +1683,34 @@ class GLU(Module):
     ):
         super().__init__()
         self.act = activation
-        self.proj = nn.Linear(dim_in, dim_out * 2)
+        self.proj = nn.Linear(dim_in, dim_out * 2)  # one linear, then chunk into (value, gate)
         self.mult_bias = nn.Parameter(torch.ones(dim_out)) if mult_bias else 1.
 
         # deepseek v4 softclamping of feedforward
+        # bounds value / gate magnitudes (tanh-based soft clamp) for training stability
 
         self.softclamp_value = softclamp_value
         self.gate_softclamp_value = gate_softclamp_value
 
     def forward(self, x):
-        x, gate = self.proj(x).chunk(2, dim = -1)
+        x, gate = self.proj(x).chunk(2, dim = -1)  # value branch, gate branch
 
         if exists(self.softclamp_value):
-            x = softclamp(x, self.softclamp_value)
+            x = softclamp(x, self.softclamp_value)  # bound the value branch
 
         if exists(self.gate_softclamp_value):
-            gate = softclamp(gate, self.gate_softclamp_value)
+            gate = softclamp(gate, self.gate_softclamp_value)  # bound the gate branch (pre-activation)
 
         return x * self.act(gate) * self.mult_bias
 
 class FeedForward(Module):
+    """
+    Standard transformer position-wise FFN: project up by `mult`, nonlinearity,
+    project back down. Supports GLU/SwiGLU variants, several activations (relu^2,
+    SoLU, swish, gelu, custom), optional post-activation LayerNorm, and deepseek-style
+    softclamping (`softclamp_value` on the up-projection, `glu_gate_softclamp_value`
+    on the GLU gate) for stability.
+    """
     def __init__(
         self,
         dim,
@@ -1644,8 +1748,10 @@ class FeedForward(Module):
             activation = nn.GELU()
 
         if glu:
+            # GLU branch: gated up-projection (value * act(gate)); softclamps applied inside GLU
             proj_in = GLU(dim, inner_dim, activation, mult_bias = glu_mult_bias, softclamp_value = softclamp_value, gate_softclamp_value = glu_gate_softclamp_value)
         else:
+            # plain branch: linear up-projection, optional softclamp, then activation
             proj_in = Sequential(
                 nn.Linear(dim, inner_dim, bias = not no_bias),
                 Lambda(partial(softclamp, value = softclamp_value)) if exists(softclamp_value) else None,
@@ -1686,13 +1792,20 @@ class FeedForward(Module):
         out = self.ff(x)
 
         if exists(deep_embed):
-            out = out * deep_embed
+            out = out * deep_embed  # optional per-token multiplicative deep embedding
 
         return out
 
 # attention. it is all we need
 
 class Attention(Module):
+    """
+    The core multi-head attention block, with a large menu of optional features:
+    flash attention, talking-heads, GQA/MQA (kv_heads), QK/value rmsnorm, value-residual
+    mixing, multi-latent attention (MLA) compressed q/kv, rotary/polar/alibi positions,
+    sparse/selective/sigmoid attention variants, and learned QKVO "modulation" deltas
+    (arXiv 2605.12357) that perturb queries/keys/values/output/attn weights.
+    """
     def __init__(
         self,
         dim,
@@ -2152,6 +2265,7 @@ class Attention(Module):
             assert not qkv_receive_diff_residuals
             needs_k_sub_heads = exists(self.to_rotateable_k)
 
+            # MLA: compress kv into a small latent that is what gets cached (decoupled rope subheads kept separately)
             latent_kv_input = self.to_latent_kv(k_input)
 
             if needs_k_sub_heads:
@@ -2177,6 +2291,7 @@ class Attention(Module):
         v = self.to_v(v_input)
 
         # allow for modulation, https://arxiv.org/abs/2605.12357
+        # externally-supplied additive perturbations to q/k/v (e.g. from a controller/hypernet)
 
         if exists(q_delta):
             q = q + q_delta
@@ -2203,6 +2318,7 @@ class Attention(Module):
         # https://arxiv.org/abs/2410.17897v1
 
         if exists(value_residual):
+            # resformer: blend this layer's values with the first layer's values (mix learned per-token)
             value_residual_mix = self.to_value_residual_mix(q_input)
             v = value_residual.lerp(v, value_residual_mix)
 
@@ -2217,11 +2333,13 @@ class Attention(Module):
             k = k * scale
 
         # maybe qk rmsnorm
+        # per-head rmsnorm on q/k (k-only variant allowed) - stabilizes attention logits
 
         q = maybe(self.q_rmsnorm)(q)
         k = maybe(self.k_rmsnorm)(k)
 
         # maybe value rmsnorm
+        # per-head rmsnorm on values (alphagenome / bytedance GR3) for further stability
 
         v = maybe(self.value_rmsnorm)(v)
 
@@ -2391,6 +2509,7 @@ class Attention(Module):
             v = v.exp()
 
         # attention is all we need
+        # attn_delta is an additive perturbation applied to the attention logits inside attend
 
         out, intermediates = self.attend(
             q, k, v,
@@ -2477,6 +2596,7 @@ class Attention(Module):
         out = self.merge_heads(out)
 
         # maybe modulate output
+        # additive perturbation to the merged attention output (output-side modulation delta)
 
         if exists(o_delta):
             out = out + o_delta
@@ -2695,17 +2815,20 @@ class AttentionLayers(Module):
         assert not (not pre_norm and sandwich_norm), 'sandwich norm cannot be used when not using prenorm'
 
         # pre norm and sandwich norm
+        # pre_norm:     norm before each branch (modern default, x = x + branch(norm(x)))
+        # sandwich_norm: additionally norm the branch output before adding back (norm both ends)
 
         self.pre_norm = pre_norm
         self.sandwich_norm = sandwich_norm
 
         # pre + post norm - keel paper and the recent looped lm (recurrent depth)
+        # norm both before the branch AND after the residual add - needed for looped/recurrent depth
 
         self.pre_and_post_norm = pre_and_post_norm
 
         if self.pre_and_post_norm:
             self.pre_norm = True
-            pre_norm_has_final_norm = False
+            pre_norm_has_final_norm = False  # post-norm already normalizes output; skip extra final norm
 
         assert at_most_one_of(gate_residual, attn_aggregated_residuals, orthog_residual, mv_split_residual), 'gate_residual, attn_aggregated_residuals, orthog_residual, and mv_split_residual are mutually exclusive'
 
@@ -2964,20 +3087,23 @@ class AttentionLayers(Module):
                     attn_kwargs = attn_aggregated_residual_kwargs
                 )
 
+            # select how the branch output gets combined with the residual stream
+            # all share the prepare()/forward() interface; pick the configured variant
+
             if has_hyper_connections:
                 residual_fn = partial(HyperConnection, num_residual_streams = num_residual_streams, sinkhorn_iters = hyper_conn_sinkhorn_iters)
 
                 if layer_type == 'a' and hyper_conn_produce_diff_views:
-                    residual_fn = partial(residual_fn, num_input_views = 3)
+                    residual_fn = partial(residual_fn, num_input_views = 3)  # separate q/k/v views
 
             elif gate_residual:
-                residual_fn = GRUGating
+                residual_fn = GRUGating                # GRU-gated residual
             elif orthog_residual:
-                residual_fn = OrthogonalResidualUpdate
+                residual_fn = OrthogonalResidualUpdate  # add only orthogonal component
             elif mv_split_residual:
-                residual_fn = MVSplitResidualUpdate
+                residual_fn = MVSplitResidualUpdate     # mean/variance split update
             else:
-                residual_fn = Residual
+                residual_fn = Residual                  # plain x + branch(x)
 
             residual = residual_fn(dim, layer_index = ind, scale_residual = scale_residual, scale_residual_constant = scale_residual_constant, **residual_fn_kwargs)
 
@@ -2990,6 +3116,9 @@ class AttentionLayers(Module):
                 skip_combine = ConcatCombine(dim, skip_indices.pop())
 
             # all normalizations of the layer
+            # pre_branch_norm: norm input before branch (pre-norm)
+            # post_branch_norm: norm branch output before residual add (sandwich)
+            # post_main_norm: norm after residual add (post-norm, or the "post" half of pre+post)
 
             pre_branch_norm = norm_fn() if pre_norm else None
             post_branch_norm = norm_fn() if sandwich_norm else None
@@ -4071,7 +4200,9 @@ class TransformerWrapper(Module):
 
         elif self.looped:
 
-            # looped
+            # looped LM / recurrent depth (Zhu et al. https://arxiv.org/abs/2510.25741)
+            # run the SAME attn_layers stack repeatedly, feeding output back as input, with a
+            # learned exit_gate deciding (at inference) when to stop early per token
 
             is_fixed_looped_steps = exists(looped_steps)
 
@@ -4102,11 +4233,12 @@ class TransformerWrapper(Module):
 
             # loop
 
-            for i in range(max_looped_steps):
+            for i in range(max_looped_steps):  # each iteration is one application of the full layer stack
                 is_first = i == 0
                 is_last = i == (max_looped_steps - 1)
 
                 # modify the cache if recurrent prompt kv cache present
+                # looped inference keeps a separate kv cache per loop step (sibling of the normal cache)
 
                 if exists(cache) and exists(cache.looped_prompt_kv_cache):
                     loop_prompt_kvs = cache.looped_prompt_kv_cache[i]
@@ -4128,6 +4260,7 @@ class TransformerWrapper(Module):
                 all_intermediates.append(intermediates)
 
                 # whether to calculate exit logits
+                # exit_gate predicts, per token, the probability of halting at this loop step
 
                 determine_early_exit = looped_inference and not looped_inference_and_is_prompt and not is_fixed_looped_steps and not is_last
 
@@ -4141,15 +4274,17 @@ class TransformerWrapper(Module):
                 should_pred_logits = looped_pred_all_logits
 
                 if determine_early_exit:
-                    exit_logprob = F.logsigmoid(layer_exit_logits)
-                    continue_logprob = F.logsigmoid(-layer_exit_logits)
+                    # work in log-space for numerical stability of the halting probability
+                    exit_logprob = F.logsigmoid(layer_exit_logits)       # log P(exit at this step)
+                    continue_logprob = F.logsigmoid(-layer_exit_logits)  # log P(continue past this step)
 
+                    # P(exit exactly here) = P(continued through all prior steps) * P(exit now)
                     step_exit_prob = (cum_continue_logprob + exit_logprob).exp()
                     cum_exit_prob += step_exit_prob
 
                     should_early_exit = cum_exit_prob >= looped_exit_prob_threshold
 
-                    # update for next iteration
+                    # accumulate log P(continue) for the next iteration's product
 
                     cum_continue_logprob += continue_logprob
 
@@ -4187,7 +4322,9 @@ class TransformerWrapper(Module):
 
         elif self.recycling:
 
-            # recycling
+            # recycling - sibling of looped depth, from Alphafold2 (Jumper et al.)
+            # also re-runs the stack, but feeds back a projected, *detached* previous output
+            # (only the last step gets gradients) instead of a learned early-exit
 
             recycle_steps = default(recycle_steps, (randrange(self.train_max_recycle_steps) + 1) if self.training else None)
             assert exists(recycle_steps) and recycle_steps > 0, '`recycle_steps` must be provided on forward if recycling is turned on and not training'
@@ -4196,9 +4333,10 @@ class TransformerWrapper(Module):
                 first_step = i == 0
                 last_step = i == (recycle_steps - 1)
 
-                context = nullcontext if last_step else torch.no_grad
+                context = nullcontext if last_step else torch.no_grad  # only backprop through the final step
 
                 with context():
+                    # feed previous (detached) output back in, projected, added to the input
                     maybe_recycled = self.recycled_proj(attended.detach()) if not first_step else 0.
 
                     attended, intermediates = _attn_layers_forward(x + maybe_recycled, cache = cache, **kwargs)
