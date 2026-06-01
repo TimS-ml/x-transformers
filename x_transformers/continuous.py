@@ -1,3 +1,14 @@
+"""
+Continuous-valued transformer wrappers.
+
+These are the continuous analogues of the token-based wrappers: inputs are
+real-valued vectors (e.g. image patches, sensor readings, world-model states)
+instead of discrete token ids. `ContinuousTransformerWrapper` handles the
+project-in / attention / project-out plumbing with optional probabilistic
+(gaussian) outputs, while `ContinuousAutoregressiveWrapper` adds autoregressive
+training, multi-step rollout, and sampling over continuous values.
+"""
+
 from __future__ import annotations
 
 import torch
@@ -38,10 +49,12 @@ def sample_from_mean_variance(
     eps = 1e-5,
     temperature = 1.
 ):
+    # draw a sample from N(mean, variance); temperature scales the std for sharper/softer sampling
     std = variance.clamp(min = eps).sqrt()
     return torch.normal(mean, std * temperature)
 
 def masked_mean(t, mask):
+    # mean over the sequence dim, ignoring masked-out positions (den clamped to avoid div-by-zero)
     t = einx.where('b n, b n d, -> b n d', mask, t, 0.)
 
     num = reduce(t, 'b n d -> b', 'sum')
@@ -53,6 +66,11 @@ def masked_mean(t, mask):
 # probabilistic loss fn
 
 class GaussianNLL(Module):
+    """Gaussian negative log-likelihood loss for probabilistic continuous heads.
+
+    `pred` is a (mean, variance) pair; scores `target` under that gaussian.
+    """
+
     def forward(self, pred, target):
         mean, var = pred
         return F.gaussian_nll_loss(mean, target, var, reduction = 'none')
@@ -60,6 +78,15 @@ class GaussianNLL(Module):
 # main classes
 
 class ContinuousTransformerWrapper(Module):
+    """Transformer wrapper for continuous vector sequences (no token embedding).
+
+    Projects continuous inputs into model dim (`to_model_dim`/`project_in`), adds
+    positional embeddings, runs the attention layers, then projects out to either
+    a plain continuous prediction or a gaussian (mean, variance) head when
+    `probabilistic = True`. Supports masking, memory tokens, prepended embeds,
+    average pooling, and kv caching.
+    """
+
     def __init__(
         self,
         *,
@@ -85,6 +112,7 @@ class ContinuousTransformerWrapper(Module):
 
         self.max_mem_len = max_mem_len
 
+        # decide whether to use an absolute positional embedding at all (else identity / handled by attn layers)
         no_abs_pos_emb = not exists(max_seq_len) or max_seq_len == 0 or not (use_abs_pos_emb and not attn_layers.disable_abs_pos_emb)
 
         if no_abs_pos_emb:
@@ -118,15 +146,18 @@ class ContinuousTransformerWrapper(Module):
         assert not (exists(dim_in) and exists(project_in)), 'either `dim_in` or `project_in` can be passed in, but not both'
         assert not (exists(dim_out) and exists(project_out)), 'either `dim_out` or `project_out` can be passed in, but not both'
 
+        # project continuous input -> model dim (identity if neither dim_in nor project_in given)
         self.project_in = default(project_in, lambda: nn.Linear(dim_in, dim, bias = False) if exists(dim_in) else nn.Identity())
 
         # output is multipled by 2 for outputting mean and log variance
 
         self.probabilistic = probabilistic
 
+        # project out to dim_out (doubled when probabilistic, to carry mean + log variance)
         self.project_out = default(project_out, lambda: nn.Linear(dim, dim_out * (2 if probabilistic else 1), bias = False) if exists(dim_out) else nn.Identity())
 
         # can cache kv
+        # only safe to cache if every attention module supports it
 
         self.can_cache_kv = all([module.can_cache_kv for module in self.modules() if isinstance(module, Attention)])
 
@@ -150,9 +181,11 @@ class ContinuousTransformerWrapper(Module):
         seq_start_pos = None,
         **kwargs
     ):
+        """Project in, attend, project out; returns predictions or gaussian (mean, variance)."""
         batch, seq, orig_mask, device = *x.shape[:2], mask, x.device
 
         # maybe seq lengths passed in
+        # build a boolean mask from per-sample lengths
 
         if exists(lens):
             assert not exists(mask), 'either `mask` or `lens` passed in, but not both'
@@ -178,6 +211,7 @@ class ContinuousTransformerWrapper(Module):
         x = self.post_emb_norm(x)
 
         # memory tokens
+        # prepend learned memory tokens to the sequence (packed so they can be split out later)
 
         if self.has_memory_tokens:
             m = repeat(self.memory_tokens, 'm d -> b m d', b = batch)
@@ -209,6 +243,7 @@ class ContinuousTransformerWrapper(Module):
         x, intermediates = self.attn_layers(x, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, input_not_include_cache = input_not_include_cache, seq_pos_offset = seq_pos_offset, return_hiddens = True, **kwargs)
 
         # splice out memory tokens
+        # recover the memory token outputs and the real sequence
 
         if self.has_memory_tokens:
             m, x = unpack(x, mem_ps, 'b * d')
@@ -219,9 +254,11 @@ class ContinuousTransformerWrapper(Module):
 
         # maybe linear project out
 
+        # skip projection when caller wants raw embeddings (e.g. for pooling in the autoencoder)
         out = self.project_out(x) if not return_embeddings else x
 
         if not return_embeddings and self.probabilistic:
+            # split the doubled output into mean and log variance, then exponentiate to get variance
             mean, log_var = rearrange(out, '... (d mean_log_var) -> mean_log_var ... d', mean_log_var = 2)
             variance = log_var.exp()
             out = stack((mean, variance))
@@ -241,6 +278,14 @@ class ContinuousTransformerWrapper(Module):
         return out
 
 class ContinuousAutoregressiveWrapper(Module):
+    """Autoregressive training / generation over continuous sequences.
+
+    Wraps a `ContinuousTransformerWrapper` to: predict each next continuous value
+    from the previous ones, generate sequences one step at a time, and optionally
+    run multi-step rollouts. With a probabilistic net it uses a Gaussian NLL loss
+    and samples from the predicted gaussian; otherwise it regresses with L1/L2.
+    """
+
     def __init__(
         self,
         net: ContinuousTransformerWrapper,
@@ -256,6 +301,7 @@ class ContinuousAutoregressiveWrapper(Module):
         self.probabilistic = probabilistic
 
         # default loss function
+        # gaussian NLL for probabilistic heads, else L1 / L2 regression
 
         if not exists(loss_fn):
             if probabilistic:
@@ -277,6 +323,7 @@ class ContinuousAutoregressiveWrapper(Module):
         cache_kv = True,
         **kwargs
     ):
+        """Autoregressively generate `seq_len` continuous steps following `start_tokens`."""
         should_cache_kv = cache_kv and self.net.can_cache_kv
         device = start_tokens.device
 
@@ -286,6 +333,7 @@ class ContinuousAutoregressiveWrapper(Module):
         assert num_dims >= 2, 'number of dimensions of your start tokens must be greater or equal to 2'
         no_batch = num_dims == 2
 
+        # allow unbatched (n d) input by adding a temporary batch dim
         if no_batch:
             start_tokens = rearrange(start_tokens, 'n d -> 1 n d')
 
@@ -298,13 +346,16 @@ class ContinuousAutoregressiveWrapper(Module):
 
         for _ in range(seq_len):
             x = out
+            # crop context to the model's max sequence length
             if exists(self.max_seq_len):
                 x = x[:, -self.max_seq_len:]
 
             net_out, new_cache = self.net(x, cache = cache, return_intermediates = True, **kwargs)
 
+            # keep only the prediction for the final position
             last_output = net_out[..., -1:, :]
 
+            # for a gaussian head, sample the next value from the predicted (mean, variance)
             if self.probabilistic:
                 mean, var = last_output
                 last_output = sample_from_mean_variance(mean, var, temperature = temperature)
@@ -314,6 +365,7 @@ class ContinuousAutoregressiveWrapper(Module):
             if should_cache_kv:
                 cache = new_cache
 
+        # drop the original prompt, returning only the newly generated steps
         out = out[:, t:]
 
         if no_batch:
@@ -328,6 +380,12 @@ class ContinuousAutoregressiveWrapper(Module):
         rollout_steps = 2,
         **kwargs
     ):
+        """Multi-step rollout training: feed the model's own predictions back in for `rollout_steps`.
+
+        Picks a random start offset per sample, autoregressively predicts that many
+        steps (sampling when probabilistic), and scores all predictions against the
+        true future. Encourages stability over multiple steps (world-model style).
+        """
         assert rollout_steps > 1
 
         steps = rollout_steps
@@ -339,6 +397,7 @@ class ContinuousAutoregressiveWrapper(Module):
         assert 'prepend_embeds' not in kwargs
 
         # lens
+        # derive a mask from per-sample lengths if provided
 
         lens = kwargs.pop('lens', None)
 
@@ -349,6 +408,7 @@ class ContinuousAutoregressiveWrapper(Module):
             mask = einx.less('j, i -> i j', seq_arange, lens)
             kwargs['mask'] = mask
 
+        # without lens, assume every sample uses its full sequence length
         if not exists(lens):
             batch, seq_len = x.shape[:2]
             lens = torch.full((batch,), seq_len, device = device)
@@ -359,6 +419,7 @@ class ContinuousAutoregressiveWrapper(Module):
 
         # pick a random range for each batch sample and aligh the sequence to the right for rollout loss
 
+        # only samples with enough tokens to roll out `steps` ahead are usable
         valid_tokens_for_rollout = (lens - steps).clamp(min = 0)
         valid_sample = valid_tokens_for_rollout > 0
 
@@ -368,6 +429,7 @@ class ContinuousAutoregressiveWrapper(Module):
             mask = mask[valid_sample]
 
         batch = x.shape[0]
+        # random start offset per sample (uniformly within its valid range)
         seq_start_pos = (torch.rand((batch,), device = device) * valid_tokens_for_rollout).floor().long()
 
         batch_arange = torch.arange(batch, device = device)
@@ -375,6 +437,7 @@ class ContinuousAutoregressiveWrapper(Module):
 
         # crop out sequence to use
 
+        # right-align so the chosen windows end at the same position across the batch
         seq_end_pos = seq_start_pos + steps
         max_end_pos = seq_end_pos.amax().item()
         x = x[:, :max_end_pos]
@@ -382,6 +445,7 @@ class ContinuousAutoregressiveWrapper(Module):
         x = align_right(x, seq_end_pos)
 
         # get the input
+        # last `steps` positions are the targets to predict
 
         inp, targets = x[:, :-steps], x[:, -steps:]
 
@@ -401,6 +465,7 @@ class ContinuousAutoregressiveWrapper(Module):
 
             last_pred = out[..., -1:, :]
 
+            # feed prediction back in as next input (sample when probabilistic)
             if self.probabilistic:
                 mean, var = last_pred
                 inp = sample_from_mean_variance(mean, var)
@@ -414,6 +479,7 @@ class ContinuousAutoregressiveWrapper(Module):
         preds = cat(preds, dim = 1)
 
         # loss
+        # score the full rollout against the true future
 
         loss = self.loss_fn(preds, targets)
 
@@ -425,14 +491,18 @@ class ContinuousAutoregressiveWrapper(Module):
         rollout_steps = 1, # they used 2 rollout steps in a successful world model paper https://ai.meta.com/vjepa/
         **kwargs
     ):
+        """Single-step AR training: predict each next continuous value from the previous ones."""
+        # delegate to multi-step rollout when requested
         if rollout_steps > 1:
             return self.forward_rollout(x, rollout_steps = rollout_steps, **kwargs)
 
+        # standard next-step shift: inputs are all-but-last, targets are all-but-first
         inp, target = x[:, :-1], x[:, 1:]
 
         assert 'prepend_embeds' not in kwargs
 
         # lens
+        # build a mask from per-sample lengths if given
 
         lens = kwargs.pop('lens', None)
 
@@ -446,6 +516,7 @@ class ContinuousAutoregressiveWrapper(Module):
 
         # mask
 
+        # trim the mask to match the shifted input length
         mask = kwargs.get('mask', None)
 
         if exists(mask) and mask.shape[1] == x.shape[1]:
@@ -459,6 +530,8 @@ class ContinuousAutoregressiveWrapper(Module):
         if exists(mask):
             assert loss.ndim > 1, 'loss should not be reduced if mask is passed in'
 
+            # equal_loss_weight_batch: average per-sequence first so each sample counts equally;
+            # otherwise just gather the unmasked positions
             if self.equal_loss_weight_batch:
                 loss = masked_mean(loss, mask)
             else:
