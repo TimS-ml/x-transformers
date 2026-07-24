@@ -135,6 +135,18 @@ class equals():
 # layer schedules
 
 def layer_schedule(start, end, depth, schedule = 'cosine'):
+    """Build a per-layer tuple of one hyperparameter, going from `start` at layer 0 to `end` at layer depth - 1.
+
+    AttentionLayers accepts a tuple in place of a scalar for the attn_* / ff_* kwargs it
+    forwards down to each layer, as long as the tuple length matches the number of layers of
+    that kind, so this is how tapered models get expressed - `ff_mult = layer_schedule(6, 2,
+    depth = 12)` gives a feedforward expansion factor that shrinks with depth (tapered
+    language models, https://arxiv.org/abs/2606.23670). Nothing here is specific to `ff_mult`;
+    attn_dropout, ff_dropout and the rest work the same way.
+
+    `schedule` is 'linear', 'cosine' (a half period of cosine, so it eases in and out at the
+    two endpoints), or any callable (start, end, t) with t sweeping 0 -> 1 across the depth.
+    """
     assert callable(schedule) or schedule in ('linear', 'cosine'), 'schedule must be a callable or one of linear or cosine'
     assert depth > 1, 'depth must be greater than 1 for tapering'
 
@@ -804,24 +816,36 @@ class PerRowDataDependentAlibi(Module):
 class RelativeProjPositionalBias(Module):
     """
     relative position bias via learned distance basis projection (Inkling model from Thinking Machines, no paper yet)
+
+    A content-dependent alternative to alibi. The module owns a small bank of shared basis
+    curves, each curve being a learned bias value for every relative distance 0 .. max_dist - 1.
+    Each token then projects its own mixing weights over that bank, per head, so the
+    bias-versus-distance profile a query sees is produced by the query's own content rather
+    than being a fixed per-head slope.
+
+    Returns an additive (b h i j) bias meant to be summed into the attention logits.
     """
 
     def __init__(
         self,
         dim,
         heads,
-        num_distance_basis = 16,
-        max_dist = 1024
+        num_distance_basis = 16,     # how many shared distance curves the bank holds; the mixture is over these
+        max_dist = 1024              # curve length - distances at or beyond this get no bias at all
     ):
         super().__init__()
         self.heads = heads
         self.num_distance_basis = num_distance_basis
         self.max_dist = max_dist
 
+        # per token, per head mixing weights over the basis curves
+
         self.to_distance_weights = nn.Sequential(
             nn.Linear(dim, heads * num_distance_basis),
             Rearrange('b n (h d) -> b h n d', h = heads)
         )
+
+        # the shared bank - one row per basis curve, one column per relative distance
 
         self.distance_bank = nn.Parameter(torch.randn(num_distance_basis, max_dist) * 0.02)
 
@@ -829,17 +853,28 @@ class RelativeProjPositionalBias(Module):
         b, n, device, h = x.shape[0], x.shape[1], x.device, self.heads
         seq_len_k = default(seq_len_k, n)
 
+        # right align the queries against the keys, so cached key values from earlier steps
+        # keep the distances they had during the prefill
+
         pos_q = torch.arange(n, device = device) + (seq_len_k - n)
         pos_k = torch.arange(seq_len_k, device = device)
 
         rel_dist = einx.subtract('i, j -> i j', pos_q, pos_k)
+
+        # only backwards distances inside the bank get a bias - future keys are negative distance,
+        # and anything past max_dist falls off the end. both are zeroed after the gather below,
+        # so the clamp exists purely to keep the gather indices in range
 
         valid_mask = (rel_dist >= 0) & (rel_dist < self.max_dist)
         clamped_dist = rel_dist.clamp(0, self.max_dist - 1)
 
         weights = self.to_distance_weights(x)
 
+        # collapse the bank into one curve per (token, head) - r indexes relative distance
+
         curves = einsum('b h n d, d r -> b h n r', weights, self.distance_bank)
+
+        # read each query's curve at the distance to every key
 
         bias = curves.gather(-1, repeat(clamped_dist, 'i j -> b h i j', b = b, h = h))
         return bias.masked_fill(~valid_mask, 0.)
@@ -1914,9 +1949,9 @@ class Attention(Module):
         data_dependent_alibi_per_row = False,
         data_dependent_alibi_per_row_dim_head = 8,
         data_dependent_alibi_kwargs: dict = dict(),
-        use_rel_proj_pos_bias = False,
-        rel_proj_num_distance_basis = 16,
-        rel_proj_max_dist = 1024,
+        use_rel_proj_pos_bias = False,        # Inkling positional bias - each token projects its own mixture over shared distance curves
+        rel_proj_num_distance_basis = 16,     # size of the shared curve bank
+        rel_proj_max_dist = 1024,             # relative distances at or beyond this receive no bias
         use_cope = False,
         cope_max_pos = 16,
         cope_soft_onehot_pos = False,
@@ -1936,7 +1971,7 @@ class Attention(Module):
         dim_latent_kv = None,
         latent_rope_subheads = None,
         onnxable = False,
-        inverted_attention = False,
+        inverted_attention = False,       # normalize the attention weights over queries rather than keys - intended for cross attention, see AttentionLayers
         attend_sdp_kwargs: dict = dict(
             enable_flash = True,
             enable_math = True,
@@ -2103,6 +2138,7 @@ class Attention(Module):
             self.data_dependent_alibi = dda_klass(**dda_kwargs, **data_dependent_alibi_kwargs)
 
         # relative projection positional bias (Inkling)
+        # unlike alibi, the bias profile is projected from the query input, so it varies per token
 
         self.rel_proj_pos_bias = None
 
@@ -2576,6 +2612,10 @@ class Attention(Module):
             attn_bias = pad_at_dim(attn_bias, (num_mem_kv, 0))
 
         # relative projection positional bias (Inkling)
+        # driven by the query side input rather than by fixed per head slopes, and unlike the two
+        # biases above it accumulates onto any existing attn_bias instead of replacing it.
+        # seq_len_k is handed over so the query positions stay right aligned against a longer
+        # cached key sequence
 
         if exists(self.rel_proj_pos_bias):
             seq_len_k = k.shape[-2]
@@ -2592,6 +2632,8 @@ class Attention(Module):
 
         # attention is all we need
         # attn_delta is an additive perturbation applied to the attention logits inside attend
+        # final_attn_mask is key side (b 1 1 j); row_mask is the untouched query side mask (b i),
+        # which inverted attention needs because it normalizes down the query axis
 
         out, intermediates = self.attend(
             q, k, v,
@@ -3054,6 +3096,9 @@ class AttentionLayers(Module):
 
         assert all([i < len(self.layer_types) for i in self.layers_execute_order])
 
+        # counts per layer kind - these are the lengths a per-layer kwarg tuple has to match
+        # for it to be spread across the stack rather than passed through as a plain value
+
         self.num_attn_layers = len(list(filter(equals('a'), layer_types)))
         self.num_cross_attn_layers = len(list(filter(equals('c'), layer_types)))
         self.num_ff_layers = len(list(filter(equals('f'), layer_types)))
@@ -3109,12 +3154,21 @@ class AttentionLayers(Module):
         is_first_self_attn = True
         learned_value_residual_mix &= add_value_residual
 
+        # silently discarded rather than forwarded - inverted attention is only offered on the
+        # cross attention layers, so `attn_inverted_attention = True` must not reach self attention
+
         attn_kwargs.pop('inverted_attention', None)
 
         # inverted attention
         # https://openreview.net/forum?id=WgQZNoQ5AB
+        # normalizes the attention weights over queries instead of keys, so queries compete for
+        # each context token the way slots do in slot attention. accepts either a single bool or
+        # one bool per cross attention layer
 
         cross_attn_inverted_attentions = cast_tuple(cross_attn_kwargs.pop('inverted_attention', False), self.num_cross_attn_layers)
+
+        # a warning and not an assert, because `causal` here describes the self attention layers;
+        # a causal decoder that also cross attends is the case worth flagging
 
         if causal and any(cross_attn_inverted_attentions):
             logger.warning('causal attention is not compatible with inverted cross attention')
@@ -3124,8 +3178,16 @@ class AttentionLayers(Module):
         # prepare kwargs iterators
         # deferred until here so explicitly popped kwargs are removed
 
+        # this is what makes layer_schedule work - a kwarg whose value is a tuple as long as the
+        # layer count for that kind gets indexed per layer, anything else is passed through as is.
+        # a tuple of some other length is therefore still a legitimate scalar value
+
         def create_layer_kwargs_iter(kwargs, length):
             return iter([{k: (v[i] if isinstance(v, tuple) and len(v) == length else v) for k, v in kwargs.items()} for i in range(length)])
+
+        # cross attention inherits from attn_kwargs, but any attn_kwarg that is a self attention
+        # schedule is dropped first, so a depth-length tuple meant for the self attention layers
+        # does not get re-indexed against a different cross attention layer count
 
         attn_kwargs_for_cross = {k: v for k, v in attn_kwargs.items() if not (isinstance(v, tuple) and len(v) == self.num_attn_layers)}
         cross_attn_kwargs_merged = {**attn_kwargs_for_cross, **cross_attn_kwargs}
@@ -3145,6 +3207,8 @@ class AttentionLayers(Module):
             block_ind = ind // len_default_block
 
             # attention, cross attention, feedforward
+            # each branch draws the next kwargs dict off its own iterator, so a per-layer schedule
+            # is consumed in construction order within its layer kind
 
             layer_qkv_receives_diff_view = layer_type == 'a' and qkv_receive_diff_residuals and not (is_first_self_attn and integrate_layers)
 
@@ -4132,7 +4196,7 @@ class TransformerWrapper(Module):
         return_attn = False,
         mems = None,
         mem_masks = None,
-        detach_mems = True,
+        detach_mems = True,          # transformer-xl default of cutting the graph at the memory boundary; set False to let gradient flow back through the memories
         recycle_steps = None,
         looped_steps = None,
         max_looped_steps = None,
@@ -4328,6 +4392,9 @@ class TransformerWrapper(Module):
             assert not (looped_inference and exists(cache) and looped_num_tokens > 1), 'when doing looped inference, you must decode one token at a time'
 
             looped_inference_and_is_prompt = looped_inference and not exists(cache) and looped_num_tokens > 1
+
+            # early exit below is a single `break` for the whole forward, and the exit step is
+            # recorded as a 1 x 1 tensor - neither can represent rows halting at different steps
 
             assert not (looped_inference and b > 1), 'looped inference does not support batch sizes greater than 1'
 
@@ -4580,6 +4647,9 @@ class TransformerWrapper(Module):
             new_mems = [cat(pair, dim = -2) for pair in zip(mems, hiddens)] if exists(mems) else hiddens
 
             new_mems = [t[..., -self.max_mem_len:, :] for t in new_mems]
+
+            # detaching is now opt-out rather than baked into the slice above, so callers that
+            # want to backpropagate across segments can keep the graph attached
 
             if detach_mems:
                 new_mems = tree_map_tensor(lambda t: t.detach(), new_mems)

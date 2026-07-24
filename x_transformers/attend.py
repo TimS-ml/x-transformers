@@ -63,6 +63,9 @@ def at_most_one_of(*bools):
 def compact(arr):
     return [*filter(exists, arr)]
 
+# l1 normalize - inverted attention softmaxes over the query axis, so the resulting
+# rows no longer sum to 1 across keys and have to be renormalized before mixing values
+
 def l1norm(t, dim = -1, eps = 1e-8):
     return F.normalize(t, p = 1, dim = dim, eps = eps)
 
@@ -158,6 +161,7 @@ def qk_l2_dist_squared(q, k):
     return unpack_one(l2_dist_squared, packed_shape, '* i j')
 
 # one-hot straight through softmax
+# `dim` picks the competing axis - -1 (keys) for ordinary attention, -2 (queries) when inverted
 
 def one_hot_straight_through(logits, temperature = 1., dim = -1):
     one_hot_indices = logits.argmax(dim = dim, keepdim = True)
@@ -174,7 +178,7 @@ def sparse_topk_attn(
     sparse_topk,
     temperature = 1.,
     straight_through = False,
-    dim = -1
+    dim = -1                    # competing axis: -1 (keys) normally, -2 (queries) when inverted
 ):
     orig_logits = logits
 
@@ -254,7 +258,7 @@ class Attend(Module):
         hard = False,
         cope = None,
         onnxable = False,
-        inverted_attention = False,
+        inverted_attention = False,      # normalize across queries instead of keys, slot-attention style - https://openreview.net/forum?id=WgQZNoQ5AB
         sdp_kwargs: dict = dict(
             enable_flash = True,
             enable_math = True,
@@ -280,6 +284,12 @@ class Attend(Module):
         assert not (flash and inverted_attention), 'flash attention not compatible with inverted attention'
 
         assert at_most_one_of(sigmoid, hard, l2_distance, gumbel_softmax, is_sparse_topk_attn)
+
+        # inverted attention flips which axis the attention function normalizes over.
+        # ordinary attention normalizes over j (keys), so each query spreads a unit of mass over keys.
+        # inverted normalizes over i (queries), so queries compete for each key - the slot attention
+        # arrangement. the axis-taking attn_fns below get bound to it (sigmoid is elementwise and a
+        # custom_attn_fn is left alone); forward() renormalizes across keys afterwards.
 
         self.inverted_attention = inverted_attention
         attn_dim = -2 if inverted_attention else -1
@@ -402,7 +412,7 @@ class Attend(Module):
         q, k, v,
         mask = None,
         attn_bias = None,
-        flash_pack_seq_kwargs = None,
+        flash_pack_seq_kwargs = None, # https://github.com/Dao-AILab/flash-attention/blob/v2.8.3/flash_attn/flash_attn_interface.py#L1370
         causal = None,
     ):
         """
@@ -417,6 +427,9 @@ class Attend(Module):
         backend context manager. Returns (out, empty Intermediates).
         """
         batch, heads, q_len, _, k_len, is_cuda, device = *q.shape, k.shape[-2], q.is_cuda, q.device
+
+        # Recommended for multi-query single-key-value attention by Tri Dao
+        # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
 
         if k.ndim == 3:
             k = repeat(k, 'b ... -> b h ...', h = q.shape[1])
@@ -435,6 +448,8 @@ class Attend(Module):
             q = cat((2 * q, q_norm_sq), dim = -1)
             q = F.pad(q, (0, 1), value = -1.)
 
+        # handle scale - by default they scale by dim_head ** -0.5, but need to take care if using cosine sim attention
+
         if exists(self.scale):
             default_scale = q.shape[-1] ** -0.5
             q = q * (self.scale / default_scale)
@@ -448,6 +463,9 @@ class Attend(Module):
             causal = False
 
         # expand key padding mask
+        # Check if mask exists and expand to compatible shape
+        # the mask arrives 4d already - forward() broadcasts a B L key padding mask up to B 1 1 L -
+        # and gets materialized here to the full B H N L that scaled_dot_product_attention expects
 
         if exists(mask):
             assert mask.ndim == 4
@@ -503,13 +521,23 @@ class Attend(Module):
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, causal, softmax_scale
 
         if self.flash_pack_seq:
+            # variable length path - the sequences are already concatenated into a single batch row,
+            # and their boundaries are carried by the cu_seqlens_q / cu_seqlens_k (+ max_seqlen_*)
+            # entries of flash_pack_seq_kwargs, which are forwarded untouched to the kernel below.
+            # that is why a dense mask is rejected and batch must be 1. upstream also dropped the
+            # older, stricter shape/monotonicity validation of the cu_seqlens tensors from here
+
             assert exists(flash_pack_seq_kwargs), 'flash_pack_seq_kwargs must be provided'
             assert not exists(mask), 'mask cannot be passed for block masking'
             assert q.shape[0] == k.shape[0] == v.shape[0] == 1, 'batch size must be 1 for sequence packing'
 
             dropout_p = self.dropout if self.training else 0.
 
+            # drop the singleton batch dim - the varlen kernel wants a flat (total_tokens, heads, dim)
+
             q, k, v = tuple(rearrange(t, '1 h n d -> n h d') for t in (q, k, v))
+
+            # efficient packed sequences flash attention masking
 
             out = self.flash_attn_varlen_func(
                 q, k, v,
@@ -542,7 +570,7 @@ class Attend(Module):
         attn_bias = None,
         prev_attn = None,
         attn_delta = None,
-        row_mask = None,
+        row_mask = None,             # query side padding mask (b i) - only consulted under inverted attention, where the pre-softmax masking has to happen on the query axis
         flash_pack_seq_kwargs = None,
         causal = None,
     ):
@@ -645,6 +673,11 @@ class Attend(Module):
 
         mask_value = -torch.finfo(sim.dtype).max
 
+        # key padding / custom mask
+        # inverted attention normalizes down the query axis, so masking keys here would be a no-op
+        # for it - the query side row_mask is masked pre-softmax instead, and the key mask is applied
+        # after the softmax further below
+
         attn_mask = mask
         if self.inverted_attention:
             attn_mask = rearrange(row_mask, 'b i -> b 1 i 1') if exists(row_mask) else None
@@ -688,6 +721,10 @@ class Attend(Module):
         # softmax (default) / sigmoid / hard one-hot straight-through / sparse-topk /
         # gumbel-softmax / custom — see the constructor.
         attn = self.attn_fn(sim)
+
+        # inverted attention - the weights were normalized down the query axis, so zero out the
+        # padded keys and then l1 normalize each query row back to summing to 1, making the value
+        # aggregation a weighted mean again (slot attention's normalization step)
 
         if self.inverted_attention:
             if exists(mask):

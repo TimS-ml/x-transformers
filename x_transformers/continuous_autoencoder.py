@@ -115,6 +115,11 @@ class ContinuousTransformerAutoencoder(Module):
     latent, and the decoder reconstructs the sequence conditioned on that latent
     (prepended as a single token). Supports deterministic or variational
     bottlenecks and L1/L2 reconstruction loss.
+
+    `dim` is the transformer's working width; `dim_input` is the width of the
+    sequence being autoencoded and `dim_latent` the width of the code. Both
+    default to `dim`, in which case the wrappers' in/out projections are dropped
+    entirely via `use_identity_if_same_dim`.
     """
 
     def __init__(
@@ -124,7 +129,7 @@ class ContinuousTransformerAutoencoder(Module):
         enc_depth,
         dec_depth,
         max_seq_len,
-        dim_input = None,
+        dim_input = None,       # width of the continuous vectors being autoencoded; defaults to the model dim, set it when the data width differs from the transformer width
         dim_latent = None,
         bottleneck: Module | None = None,
         bottleneck_type: Literal['deterministic', 'variational'] = 'deterministic',
@@ -139,6 +144,9 @@ class ContinuousTransformerAutoencoder(Module):
         **kwargs
     ):
         super().__init__()
+        # three widths are decoupled here: dim (transformer working width),
+        # dim_input (the data being reconstructed), dim_latent (bottleneck code).
+        # both default to dim, which reproduces the pre-`dim_input` behavior
         dim_input = default(dim_input, dim)
         dim_latent = default(dim_latent, dim)
 
@@ -146,7 +154,7 @@ class ContinuousTransformerAutoencoder(Module):
         self.encoder = ContinuousTransformerWrapper(
             dim_in = dim_input,
             max_seq_len = max_seq_len,
-            use_identity_if_same_dim = True,
+            use_identity_if_same_dim = True,    # dim_input == dim (the default) -> no project_in at all, rather than a square matmul
             attn_layers = Encoder(
                 dim = dim,
                 depth = enc_depth,
@@ -174,11 +182,13 @@ class ContinuousTransformerAutoencoder(Module):
         )
 
         # decoder: reconstructs the continuous sequence (dim -> dim) from the prepended latent token
+        # since `dim_input` was introduced that round trip is dim_input -> dim_input, with the
+        # transformer still working at `dim` in between; the two coincide by default
         self.decoder = ContinuousTransformerWrapper(
             dim_in = dim_input,
-            dim_out = dim_input,
+            dim_out = dim_input,    # reconstruction target is the raw input width, so recon loss compares against `seq` directly
             max_seq_len = max_seq_len,
-            use_identity_if_same_dim = True,
+            use_identity_if_same_dim = True,    # both projections collapse to Identity when dim_input == dim
             attn_layers = Decoder(
                 dim = dim,
                 depth = dec_depth,

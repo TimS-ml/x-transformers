@@ -29,6 +29,8 @@ Training Wrappers:
     - NonAutoregressiveWrapper: For non-autoregressive generation
     - XLAutoregressiveWrapper: Transformer-XL style autoregressive wrapper
     - BeliefStateWrapper: Wrapper for belief state modeling
+    - NextLatentWrapper: Adds a latent-dynamics rollout objective, predicting the
+      net's own next hidden latent alongside the usual token loss
 
 Specialized Architectures:
     - ContinuousTransformerWrapper: For continuous (non-tokenized) inputs
@@ -43,6 +45,8 @@ Training Methods:
 
 Utilities:
     - EntropyBasedTokenizer: Tokenizer based on entropy
+    - layer_schedule: Builds a per-layer tuple tapering a hyperparameter
+      (ff_mult, dropout, ...) from `start` to `end` across `depth`
 
 For detailed documentation on each component, see their respective modules.
 """
@@ -62,7 +66,7 @@ from x_transformers.x_transformers import (
     TransformerWrapper,
     ViTransformerWrapper,
     TransformerBlock,
-    layer_schedule
+    layer_schedule   # helper, not a module: returns a depth-length tuple of per-layer hyperparameter values to feed the layer kwargs
 )
 
 # Training wrappers

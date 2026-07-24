@@ -80,11 +80,16 @@ class GaussianNLL(Module):
 class ContinuousTransformerWrapper(Module):
     """Transformer wrapper for continuous vector sequences (no token embedding).
 
-    Projects continuous inputs into model dim (`to_model_dim`/`project_in`), adds
-    positional embeddings, runs the attention layers, then projects out to either
-    a plain continuous prediction or a gaussian (mean, variance) head when
+    Projects continuous inputs into model dim (`project_in`), adds positional
+    embeddings, runs the attention layers, then projects out to either a plain
+    continuous prediction or a gaussian (mean, variance) head when
     `probabilistic = True`. Supports masking, memory tokens, prepended embeds,
     average pooling, and kv caching.
+
+    Either projection collapses to `nn.Identity` when its target width is not
+    requested, or - with `use_identity_if_same_dim` - when the requested width
+    already matches the model dim, so a wrapper can be asked for `dim_in`/`dim_out`
+    unconditionally without paying for a redundant square matmul.
     """
 
     def __init__(
@@ -104,7 +109,7 @@ class ContinuousTransformerWrapper(Module):
         scaled_sinu_pos_emb = False,
         average_pool_embed = False,
         probabilistic = False,
-        use_identity_if_same_dim = False,
+        use_identity_if_same_dim = False,   # skip the in/out linear entirely (nn.Identity) when the requested width already equals the model dim, instead of learning a square projection
     ):
         super().__init__()
         dim = attn_layers.dim
@@ -147,6 +152,7 @@ class ContinuousTransformerWrapper(Module):
         assert not (exists(dim_in) and exists(project_in)), 'either `dim_in` or `project_in` can be passed in, but not both'
         assert not (exists(dim_out) and exists(project_out)), 'either `dim_out` or `project_out` can be passed in, but not both'
 
+        # project continuous input -> model dim (identity if neither dim_in nor project_in given, or if use_identity_if_same_dim and dim_in already equals dim)
         has_project_in = exists(dim_in) and (not use_identity_if_same_dim or dim_in != dim)
         self.project_in = default(project_in, lambda: nn.Linear(dim_in, dim, bias = False) if has_project_in else nn.Identity())
 
@@ -154,7 +160,10 @@ class ContinuousTransformerWrapper(Module):
 
         self.probabilistic = probabilistic
 
+        # project out to dim_out (doubled when probabilistic, to carry mean + log variance)
         dim_out_with_prob = (dim_out * (2 if probabilistic else 1)) if exists(dim_out) else None
+
+        # identity if neither dim_out nor project_out given, or if use_identity_if_same_dim and that (possibly doubled) width already equals dim
         has_project_out = exists(dim_out) and (not use_identity_if_same_dim or dim_out_with_prob != dim)
 
         self.project_out = default(project_out, lambda: nn.Linear(dim, dim_out_with_prob, bias = False) if has_project_out else nn.Identity())

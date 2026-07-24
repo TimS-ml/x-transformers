@@ -1,5 +1,5 @@
 from __future__ import annotations
-import math
+import math    # arrived upstream with the accumulated-entropy helper; no `math.` call site in this module at present
 from itertools import zip_longest
 
 import torch
@@ -77,6 +77,54 @@ def get_accumulated_threshold_mask(
     threshold,
     ignore_entropy_below = 0.
 ):
+    """
+    Segment a sequence by *accumulated* entropy rather than per-position entropy.
+
+    Walks left to right keeping a running sum of entropy since the last boundary.
+    A boundary is emitted at the first position where that running sum reaches
+    `threshold`, and the accumulator then resets from that boundary. The result is
+    a chain of cut points that each close off roughly `threshold` nats of total
+    surprise, so segment length adapts inversely to local surprise density.
+
+    How this differs from the global-threshold rule (`entropies >= threshold`)
+    used by the original BLT segmentation: that rule tests every position
+    independently, so a single spike always cuts and a long stretch of mildly
+    surprising positions never cuts no matter how much surprise it holds in
+    aggregate. Accumulation integrates instead of comparing pointwise, so such a
+    run does eventually cut on its own - but only if its entropies survive
+    `ignore_entropy_below`; a run zeroed by the floor still yields no boundary at
+    all, and bounding that case is left to the caller's `max_token_size`. It is
+    also a *chain*: the boundary set depends on where the previous boundary
+    landed, whereas the pointwise rule is position-local.
+
+    `ignore_entropy_below` zeroes out any entropy strictly under the floor before
+    accumulating, so highly predictable positions contribute nothing at all to the
+    running sum. Setting it equal to `threshold` recovers the original
+    non-accumulating behavior: every surviving position alone clears the threshold
+    and therefore cuts immediately.
+
+    Implementation is a successor-pointer chase rather than a python loop. Each
+    prefix position gets a pointer to the position where its threshold is next
+    met (`torch.searchsorted` over the entropy cumsum, valid because entropies are
+    non-negative so the cumsum is non-decreasing), and the orbit of the start
+    state under that pointer is computed by pointer doubling in O(log n) steps.
+
+    Args:
+        entropies (torch.Tensor): Per-position entropies, Float['b n']. Assumed
+                                  non-negative (as produced by
+                                  `calc_entropy_from_logits`).
+        threshold (float): Nats of accumulated entropy that close a segment.
+                           Larger values mean fewer, longer segments.
+        ignore_entropy_below (float): Floor under which a position's entropy is
+                                      treated as 0 and contributes nothing to the
+                                      accumulator (default: 0., i.e. disabled).
+
+    Returns:
+        torch.Tensor: Bool['b n'] mask, True at each position that *ends* a
+                      segment. Note this is a boundary mask, not a "surprising
+                      position" mask - the trailing padding positions are not
+                      excluded here, the caller ANDs in the length mask.
+    """
     # https://www.nature.com/articles/s41467-026-73345-0
 
     batch, seq_len, device = *entropies.shape, entropies.device
@@ -84,28 +132,54 @@ def get_accumulated_threshold_mask(
     if ignore_entropy_below > 0.:
         entropies = entropies.masked_fill(entropies < ignore_entropy_below, 0.)
 
+    # cum_padded[b, i] = total entropy over positions [0, i), with a leading 0
+    # so index i means "state before consuming position i"; length seq_len + 1
+
     cum_padded = F.pad(entropies.cumsum(dim = -1), (1, 0), value = 0.)
 
     # find next threshold boundary
+
+    # leftmost j with cum[j] - cum[i] >= threshold, i.e. the first cut point
+    # reachable from state i; returns seq_len + 1 when the threshold is never met
 
     next_idx = torch.searchsorted(cum_padded, cum_padded + threshold)
 
     # ensure strict progression
 
+    # searchsorted breaks ties leftward, so flat cumsum plateaus (zeroed entropies,
+    # or threshold = 0) can return an index <= i and stall the chase; force i + 1
+
     next_idx = torch.maximum(next_idx, torch.arange(seq_len + 1, device = device) + 1)
 
     # absorbing state
 
+    # slot seq_len + 1 points at itself, so any chain that runs off the end parks
+    # there instead of indexing out of bounds during doubling
+
     next_idx = F.pad(next_idx, (0, 1), value = seq_len + 1)
+
+    # mark only the start state; the marked set is exactly the orbit of state 0
+    # under next_idx, i.e. the greedy boundary chain
 
     reachable = torch.zeros((batch, seq_len + 2), dtype = torch.int32, device = device)
     reachable[:, 0] = 1
 
     # parallel pointer doubling
 
+    # after k iterations next_idx holds next_idx^(2^k) and `reachable` covers every
+    # state within 2^k - 1 hops, so bit_length() iterations cover all seq_len hops.
+    # add-then-clamp rather than plain scatter_ so this ORs marks together: many
+    # states share one successor, and a scatter_ would let an unmarked source
+    # overwrite an already-marked slot back to 0. the .clone() is because
+    # scatter_add_ writes into the same tensor it reads as src
+
     for _ in range(seq_len.bit_length()):
         reachable.scatter_add_(1, next_idx, reachable.clone()).clamp_max_(1)
         next_idx = next_idx.gather(1, next_idx)
+
+    # drop the synthetic start state (0) and the absorbing state (seq_len + 1);
+    # remaining slot j is the boundary after consuming j tokens -> sequence index
+    # j - 1, giving a Bool['b n'] aligned with `entropies`
 
     return reachable[:, 1:-1].bool()
 
@@ -128,11 +202,23 @@ class EntropyBasedTokenizer(Module):
     a good place to segment the sequence into separate tokens, as it represents
     positions where the model is "surprised" by what comes next.
 
+    Two segmentation rules are available. The default (BLT) rule is pointwise:
+    a boundary wherever `entropy >= entropy_threshold`. With `accumulate_entropy`
+    the rule instead integrates entropy since the previous boundary and cuts once
+    that running sum reaches the threshold - see `get_accumulated_threshold_mask`.
+
     Attributes:
         decoder (Module): A trained decoder model that produces logits for next-token
                          prediction. Used to calculate entropy at each position.
         entropy_threshold (float): The threshold value for entropy. Positions with
                                   entropy above this threshold become token boundaries.
+                                  Read as accumulated nats when `accumulate_entropy`.
+        accumulate_entropy (bool): Switches from the pointwise threshold to the
+                                  accumulated-entropy chain.
+        ignore_entropy_below (float): Entropy floor below which a position is
+                                     treated as contributing nothing to the
+                                     accumulator. Only meaningful when
+                                     `accumulate_entropy` is set.
         max_token_size (int | None): Optional maximum size for any single token.
                                      Prevents overly long tokens in cases of
                                      repeating subsequences.
@@ -154,7 +240,16 @@ class EntropyBasedTokenizer(Module):
             entropy_threshold (float): The entropy threshold for creating token
                                       boundaries. Higher values create fewer,
                                       longer tokens; lower values create more,
-                                      shorter tokens.
+                                      shorter tokens. Compared per-position by
+                                      default, or against accumulated entropy
+                                      when `accumulate_entropy` is set.
+            accumulate_entropy (bool): If True, segment by accumulated entropy
+                                      (`get_accumulated_threshold_mask`) instead
+                                      of the pointwise BLT threshold. Default: False.
+            ignore_entropy_below (float): Entropy floor for the accumulator;
+                                      positions under it add nothing to the
+                                      running sum. Must be <= entropy_threshold.
+                                      Default: 0.
             max_token_size (int | None): Optional maximum number of elements
                                         allowed in a single token. If specified,
                                         tokens exceeding this size will be split
@@ -166,6 +261,9 @@ class EntropyBasedTokenizer(Module):
         self.accumulate_entropy = accumulate_entropy
 
         # when set to be equal to the entropy threshold (with accumulating entropy) it will recover the original non-accumulating behavior
+        # (a floor of `entropy_threshold` zeroes every sub-threshold position, so any
+        # position that survives already clears the threshold on its own and cuts at once);
+        # a floor above the threshold would be incoherent, hence the assert
         assert ignore_entropy_below <= entropy_threshold, 'ignore_entropy_below must be lower than or equal to the entropy threshold'
         self.ignore_entropy_below = ignore_entropy_below
 
@@ -216,7 +314,9 @@ class EntropyBasedTokenizer(Module):
         Implementation Details:
             1. Runs the decoder on the input to get logits
             2. Calculates entropy from the logits
-            3. Creates boundaries where entropy >= threshold
+            3. Creates boundaries where entropy >= threshold, or - when
+               `accumulate_entropy` is set - where entropy accumulated since the
+               previous boundary reaches the threshold
             4. Optionally enforces max_token_size constraint
             5. Computes token lengths from boundaries
             6. Optionally segments the actual sequence based on boundaries
@@ -253,6 +353,11 @@ class EntropyBasedTokenizer(Module):
 
         # the mask for tokens that were of a sufficient surprise level
 
+        # two regimes, both yielding Bool['b n'] marking the END position of a token:
+        # accumulated - a chain of cuts, each closing off `entropy_threshold` nats of
+        # integrated surprise; pointwise - the original BLT rule, every position whose
+        # own entropy clears the threshold
+
         if self.accumulate_entropy:
             over_thres_mask = get_accumulated_threshold_mask(
                 entropies,
@@ -261,6 +366,9 @@ class EntropyBasedTokenizer(Module):
             )
         else:
             over_thres_mask = entropies >= self.entropy_threshold
+
+        # drop boundaries landing in the padded tail; `mask` is a scalar True when
+        # every sequence is full length, so this is a no-op in the fixed-length case
 
         over_thres_mask &= mask
 
