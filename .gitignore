@@ -4,9 +4,6 @@ enwik9.gz
 notes/
 checkpoints/
 
-# OpenCode/superpowers planning & spec docs (internal process, do not push)
-docs/superpowers/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
