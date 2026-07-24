@@ -14,8 +14,8 @@ merges. Abbreviations used below: `xt` = `x_transformers.py`, `attend` =
 `xl_autoregressive_wrapper.py`, `nlw` = `next_latent_wrapper.py`, `lejepa` =
 `gpt_lejepa.py`. Constructor kwargs and instance attributes are not symbols, so
 they are written in prose with their owning class in parentheses — e.g.
-`looped_exit_prob_threshold` (`xt::TransformerWrapper`). This doc tracks upstream
-v2.24.0.
+`looped_exit_prob_threshold` (`xt::TransformerWrapper`). `scripts/check_doc_symbols.py`
+verifies that every anchor still resolves. This doc tracks upstream v2.24.0.
 
 ## 1. Forward pass — `AttentionLayers.forward`
 

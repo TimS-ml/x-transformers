@@ -9,7 +9,8 @@ add embeddings, heads, and training/inference behavior on top.
 > (`Class`, `Class.method`, or a module-level function), never a line number.
 > Resolve one with `rg -n 'class Symbol|def Symbol' x_transformers/<module>.py`
 > or with ctags. Because nothing here is positional, the anchors survive
-> re-annotation and upstream merges. This doc tracks upstream **v2.24.0**; it is
+> re-annotation and upstream merges. `scripts/check_doc_symbols.py` verifies
+> that every one of them still resolves. This doc tracks upstream **v2.24.0**; it is
 > the map, `core_components.md` is the parts list, and `model_inference_flow.md`
 > is the runtime behavior.
 >

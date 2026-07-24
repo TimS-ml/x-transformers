@@ -4,8 +4,9 @@ The building-block layers and their configuration flags. Flags marked
 **(forward)** are passed per-call rather than at construction. Code references
 are symbol anchors of the form `<abbrev>::Class.method` — a dotted Python path
 resolvable with ripgrep or ctags, so they survive re-annotation and upstream
-merges. Module abbreviations: `xt` = `x_transformers.py`, `attend` =
-`attend.py`. Tracks upstream **v2.24.0**.
+merges; `scripts/check_doc_symbols.py` verifies they all still resolve. Module
+abbreviations: `xt` = `x_transformers.py`, `attend` = `attend.py`. Tracks
+upstream **v2.24.0**.
 
 ## 1. `Attention` (`xt::Attention`)
 
