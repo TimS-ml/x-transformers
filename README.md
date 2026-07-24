@@ -1967,6 +1967,25 @@ out = attention(
 ```
 
 ```bibtex
+@inproceedings{Locatello2020SlotAttention,
+    title     = {Object-Centric Learning with Slot Attention},
+    author    = {Francesco Locatello and Dirk Weissenborn and Thomas Unterthiner and Aravindh Mahendran and Georg Heigold and Jakob Uszkoreit and Alexey Dosovitskiy and Thomas Kipf},
+    booktitle = {Advances in Neural Information Processing Systems},
+    year      = {2020}
+}
+```
+
+```bibtex
+@inproceedings{wu2023invertedattention,
+    title   = {Inverted-Attention Transformers can Learn Object Representations: Insights from Slot Attention},
+    author  = {Yi-Fu Wu and Klaus Greff and Gamaleldin Fathy Elsayed and Michael Curtis Mozer and Thomas Kipf and Sjoerd van Steenkiste},
+    booktitle = {UniReps:  the First Workshop on Unifying Representations in Neural Models},
+    year    = {2023},
+    url     = {https://openreview.net/forum?id=WgQZNoQ5AB}
+}
+```
+
+```bibtex
 @misc{so2021primer,
     title   = {Primer: Searching for Efficient Transformers for Language Modeling},
     author  = {David R. So and Wojciech Mańke and Hanxiao Liu and Zihang Dai and Noam Shazeer and Quoc V. Le},
@@ -2809,6 +2828,66 @@ out = attention(
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2605.06169},
+}
+```
+
+```bibtex
+@misc{balestriero2025lejepaprovablescalableselfsupervised,
+    title   = {LeJEPA: Provable and Scalable Self-Supervised Learning Without the Heuristics},
+    author  = {Randall Balestriero and Yann LeCun},
+    year    = {2025},
+    eprint  = {2511.08544},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2511.08544},
+}
+```
+
+```bibtex
+@misc{tandon2025endtoendtesttimetraininglong,
+    title   = {End-to-End Test-Time Training for Long Context},
+    author  = {Arnuv Tandon and Karan Dalal and Xinhao Li and Daniel Koceja and Marcel Rød and Sam Buchanan and Xiaolong Wang and Jure Leskovec and Sanmi Koyejo and Tatsunori Hashimoto and Carlos Guestrin and Jed McCaleb and Yejin Choi and Yu Sun},
+    year    = {2025},
+    eprint  = {2512.23675},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2512.23675},
+}
+```
+
+```bibtex
+@misc{huang2025llmjepalargelanguagemodels,
+    title   = {LLM-JEPA: Large Language Models Meet Joint Embedding Predictive Architectures},
+    author  = {Hai Huang and Yann LeCun and Randall Balestriero},
+    year    = {2025},
+    eprint  = {2509.14252},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL},
+    url     = {https://arxiv.org/abs/2509.14252},
+}
+```
+
+```bibtex
+@misc{teoh2026nextlatentpredictiontransformerslearn,
+    title   = {Next-Latent Prediction Transformers Learn Compact World Models},
+    author  = {Jayden Teoh and Manan Tomar and Kwangjun Ahn and Edward S. Hu and Tim Pearce and Pratyusha Sharma and Akshay Krishnamurthy and Riashat Islam and Alex Lamb and John Langford},
+    year    = {2026},
+    eprint  = {2511.05963},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2511.05963},
+}
+```
+
+```bibtex
+@misc{bayat2026taperedlanguagemodels,
+    title   = {Tapered Language Models},
+    author  = {Reza Bayat and Ali Behrouz and Aaron Courville},
+    year    = {2026},
+    eprint  = {2606.23670},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2606.23670},
 }
 ```
 

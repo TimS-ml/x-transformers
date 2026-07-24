@@ -1,19 +1,19 @@
-"""
-XL Autoregressive Wrapper Module
-
-This module provides an autoregressive wrapper for Transformer-XL models, enabling
-text generation and training with memory mechanisms. The wrapper handles chunking
-of long sequences and maintains memory across segments for improved context retention.
-"""
-
+from __future__ import annotations
 from math import ceil
+from functools import reduce
+from contextlib import nullcontext
 
 import torch
 from torch import nn
+from torch.nn import Module
 import torch.nn.functional as F
+from torch.func import functional_call, vmap
 
-from einops import rearrange, pack, unpack
-from x_transformers.autoregressive_wrapper import top_p, top_k, eval_decorator
+from einops import rearrange, repeat, pack, unpack
+from x_transformers.autoregressive_wrapper import top_p, top_k, eval_decorator, cast_tuple
+
+from torch_einops_utils import masked_mean, mask_after, maybe, tree_map_tensor
+from torch_einops_utils.device import module_device
 
 # helper functions
 
@@ -29,37 +29,221 @@ def exists(val):
     """
     return val is not None
 
+def default(val, d):
+    return val if exists(val) else d
+
+def is_empty(arr):
+    return len(arr) == 0
+
+def first(it, default = None):
+    return next(iter(it), default)
+
 def divisible_by(numer, denom):
     return (numer % denom) == 0
 
+def get_module_by_path(model, path):
+    return reduce(getattr, path.split('.'), model)
+
+def set_module_by_path(model, path, new_mod):
+    *parts, last = path.split('.')
+    mod = reduce(getattr, parts, model)
+    setattr(mod, last, new_mod)
+
+# tensor functions
+
+def repeat_batch(t, batch_size):
+    return repeat(t, '... -> b ...', b = batch_size)
+
+def pack_one_with_inverse(t, pattern):
+    packed, ps = pack([t], pattern)
+    def inverse(t_in):
+        return unpack(t_in, ps, pattern)[0]
+    return packed, inverse
+
+def transpose(t):
+    return rearrange(t, '... i j -> ... j i')
+
+# Muon update rule (Newton-Schulz) - Keller Jordan et al.
+
+def newtonschulz5(
+    t,
+    steps = 5,
+    eps = 1e-7,
+    coefs = (3.4445, -4.7750, 2.0315)
+):
+    if t.ndim < 3:
+        return t, False
+
+    rows, cols = t.shape[-2:]
+    should_transpose = rows > cols
+
+    if should_transpose:
+        t = transpose(t)
+
+    t, inv_pack = pack_one_with_inverse(t, '* i j')
+    t = t / t.norm(dim = (-1, -2), keepdim = True).clamp(min = eps)
+
+    a, b, c = coefs
+
+    for _ in range(steps):
+        A = t @ transpose(t)
+        B = b * A + c * A @ A
+        t = a * t + B @ t
+
+    t = inv_pack(t)
+
+    if should_transpose:
+        t = transpose(t)
+
+    return t, True
+
+# episodic memories
+
+class EpisodicMemories(Module):
+    def __init__(
+        self,
+        depth,
+        heads,
+        seq_len,
+        dim_head
+    ):
+        super().__init__()
+        self.mem_kv = nn.Parameter(torch.randn(2, depth, heads, seq_len, dim_head))
+        nn.init.normal_(self.mem_kv, std = 0.02)
+
+    def forward(self):
+        return self.mem_kv
+
+class EpisodicMemoryWrapper(Module):
+    def __init__(
+        self,
+        net,
+        episodic_mem_len
+    ):
+        super().__init__()
+        self.net = net
+
+        with torch.no_grad():
+            mock_input = torch.zeros((1, 1), dtype = torch.long, device = module_device(net))
+            _, intermediates = net(mock_input, return_intermediates = True)
+
+        attn_intermediates = [interm for interm in intermediates.attn_intermediates if interm.layer_type == 'a']
+
+        assert not is_empty(attn_intermediates), 'no attention layers found for episodic memory wrapper'
+
+        first_cached_kv = first(attn_intermediates).cached_kv[0]
+        _, kv_heads, _, dim_head = first_cached_kv.shape
+        depth = len(attn_intermediates)
+
+        self.episodic_mems = EpisodicMemories(
+            depth = depth,
+            heads = kv_heads,
+            seq_len = episodic_mem_len,
+            dim_head = dim_head
+        )
+
+    def get_additional_kv(self, batch_size):
+        mem_kv = self.episodic_mems()
+
+        if mem_kv.ndim == 5:
+            mem_kv = repeat_batch(mem_kv, batch_size)
+
+        mem_k, mem_v = mem_kv.unbind(dim = 1)
+        return [(k, v) for k, v in zip(mem_k.unbind(dim = 1), mem_v.unbind(dim = 1))]
+
+    def forward(self, x, **kwargs):
+        batch = x.shape[0]
+
+        kwargs.update(
+            self_attn_additional_kv = self.get_additional_kv(batch)
+        )
+
+        return self.net(x, **kwargs)
+
+# ttt module wrapper
+
+class TTTModuleWrapper(Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.batch_params = None
+
+    def reset(self):
+        self.batch_params = None
+
+    @staticmethod
+    def reset_all(module):
+        for mod in module.modules():
+            if isinstance(mod, TTTModuleWrapper):
+                mod.reset()
+
+    def forward(self, *args, **kwargs):
+        if not exists(self.batch_params):
+            return self.module(*args, **kwargs)
+
+        def call_single(params, *args_single):
+            return functional_call(self.module, params, args_single, kwargs)
+
+        return vmap(call_single)(self.batch_params, *args)
+
+# custom TTT loss modules
+
+class TTTMetaLearningTargetKLLoss(Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        num_classes,
+        depth = 1,
+        heads = 4,
+        dim_head = 64,
+        **kwargs
+    ):
+        super().__init__()
+        from x_transformers.x_transformers import Encoder
+
+        self.encoder = Encoder(
+            dim = dim,
+            depth = depth,
+            heads = heads,
+            attn_dim_head = dim_head,
+            **kwargs
+        )
+
+        self.to_prediction = nn.Linear(dim, num_classes)
+        self.to_meta_prediction = nn.Linear(dim, num_classes)
+
+    def forward(self, intermediates, mask = None):
+        hiddens = intermediates.last_layer_hiddens
+
+        pred = self.to_prediction(hiddens)
+
+        encoded = self.encoder(hiddens, mask = mask)
+        meta_pred = self.to_meta_prediction(encoded)
+
+        prob_earlier = pred.softmax(dim = -1)
+        log_prob_encoded = meta_pred.log_softmax(dim = -1)
+
+        loss = F.kl_div(log_prob_encoded, prob_earlier, reduction = 'none').sum(dim = -1)
+        return loss
+
 # xl autoregressive wrapper class
 
-class XLAutoregressiveWrapper(nn.Module):
-    """
-    Transformer-XL Autoregressive Wrapper
-
-    This wrapper enables autoregressive text generation and training for Transformer-XL models.
-    It handles the chunking of long sequences into segments that fit within the model's maximum
-    sequence length, and maintains memory across segments to provide extended context.
-
-    The wrapper provides two main functionalities:
-    1. Training: Processes sequences in chunks, maintaining memory across segments, and computes
-       weighted cross-entropy loss across all chunks.
-    2. Generation: Generates new tokens autoregressively using cached memories and optional
-       filtering strategies (top-k, top-p, temperature).
-
-    Attributes:
-        net: The underlying Transformer-XL network
-        max_seq_len (int): Maximum sequence length the network can handle per segment
-        ignore_index (int): Index to ignore in loss calculation (typically for padding tokens)
-        pad_value (int): Value to use for padding generated sequences
-    """
-
+class XLAutoregressiveWrapper(Module):
     def __init__(
         self,
         net,
         ignore_index = -100,
-        pad_value = 0
+        pad_value = 0,
+        tbptt_steps = 1,
+        ttt_module_paths = tuple(),
+        ttt_lr = 1e-3,
+        ttt_wd = 0.01,
+        ttt_use_muon = False,
+        ttt_muon_steps = 5,
+        ttt_muon_lr = 1e-2,
+        ttt_custom_loss_module: Module | None = None,
+        episodic_mem_len = 0
     ):
         """
         Initialize the XL Autoregressive Wrapper.
@@ -75,10 +259,163 @@ class XLAutoregressiveWrapper(nn.Module):
         # Store padding configuration
         self.pad_value = pad_value
         self.ignore_index = ignore_index
+        self.tbptt_steps = tbptt_steps
 
         # Store the network and extract its maximum sequence length
         self.net = net
         self.max_seq_len = net.max_seq_len
+        self.output_is_log_prob = net.output_is_log_prob
+
+        self.ttt_module_paths = ttt_module_paths
+        self.ttt_lr = ttt_lr
+        self.ttt_wd = ttt_wd
+        self.ttt_use_muon = ttt_use_muon
+        self.ttt_muon_steps = ttt_muon_steps
+        self.ttt_muon_lr = ttt_muon_lr
+        self.ttt_custom_loss_module = ttt_custom_loss_module
+
+        self.has_episodic_mem = episodic_mem_len > 0
+
+        # maybe wrap network with episodic memory wrapper
+
+        if self.has_episodic_mem:
+            net = EpisodicMemoryWrapper(net, episodic_mem_len)
+
+        self.net = net
+
+        # format ttt module paths to always be (source_path, target_path)
+
+        self.ttt_paths_map = tuple(cast_tuple(item, 2) for item in ttt_module_paths)
+
+        # modify paths to have 'net.' prepended if wrapped
+
+        if self.has_episodic_mem:
+            prepended_paths_map = []
+            for src, tgt in self.ttt_paths_map:
+                src = f'net.{src}' if src != 'episodic_mems' else src
+                tgt = f'net.{tgt}' if tgt != 'episodic_mems' else tgt
+                prepended_paths_map.append((src, tgt))
+
+            self.ttt_paths_map = tuple(prepended_paths_map)
+
+        # gather all unique wrappers
+
+        self.ttt_wrappers = dict()
+
+        for source_path, target_path in self.ttt_paths_map:
+            for path in (source_path, target_path):
+                if path in self.ttt_wrappers:
+                    continue
+
+                mod = get_module_by_path(net, path)
+                wrapper = TTTModuleWrapper(mod)
+                set_module_by_path(net, path, wrapper)
+
+                self.ttt_wrappers[path] = wrapper
+
+        if self.has_ttt:
+            assert tbptt_steps > 1, 'tbptt_steps must be greater than 1 if ttt is turned on'
+
+    @property
+    def has_ttt(self):
+        return len(self.ttt_wrappers) > 0
+
+    def init_ttt(self, batch):
+        if not self.has_ttt:
+            return
+
+        for wrapper in self.ttt_wrappers.values():
+            wrapper.batch_params = tree_map_tensor(
+                lambda t: repeat_batch(t, batch),
+                dict(wrapper.module.named_parameters())
+            )
+
+    def update_ttt(
+        self,
+        logits,        # (b n c)
+        chunk_labels,  # (b n)
+        create_graph = False,
+        intermediates = None
+    ):
+        if not self.has_ttt:
+            return
+
+        # compute loss
+
+        mask = chunk_labels != self.ignore_index
+
+        if exists(self.ttt_custom_loss_module):
+            assert exists(intermediates), 'intermediates must be passed to update_ttt when using ttt_custom_loss_module'
+            loss_t = self.ttt_custom_loss_module(intermediates, mask = mask)
+            loss_t_per_batch = masked_mean(loss_t, mask) if loss_t.ndim > 1 else loss_t
+        else:
+            loss_fn = F.cross_entropy if not self.output_is_log_prob else F.nll_loss
+            loss_t = loss_fn(
+                rearrange(logits, 'b n c -> b c n'),
+                chunk_labels,
+                ignore_index = self.ignore_index,
+                reduction = 'none'
+            )
+
+            loss_t_per_batch = masked_mean(loss_t, mask)
+
+        # gather all batch parameters for source modules
+
+        all_batch_params = [
+            param
+            for source_path, _ in self.ttt_paths_map
+            for param in self.ttt_wrappers[source_path].batch_params.values()
+        ]
+
+        # compute gradients
+
+        grads = torch.autograd.grad(
+            loss_t_per_batch.sum(),
+            all_batch_params,
+            create_graph = create_graph,
+            retain_graph = create_graph,
+            allow_unused = True
+        )
+
+        # update target parameters with source gradients
+
+        grad_idx = 0
+
+        for source_path, target_path in self.ttt_paths_map:
+            source_wrapper = self.ttt_wrappers[source_path]
+            target_wrapper = self.ttt_wrappers[target_path]
+
+            num_params = len(source_wrapper.batch_params)
+            wrapper_grads = grads[grad_idx : grad_idx + num_params]
+            grad_idx += num_params
+
+            assert len(source_wrapper.batch_params) == len(target_wrapper.batch_params), f'source module {source_path} and target module {target_path} must have the same number of parameters'
+
+            # maybe muon
+
+            if self.ttt_use_muon:
+                muon_results = [newtonschulz5(g, steps = self.ttt_muon_steps) if exists(g) else (None, False) for g in wrapper_grads]
+                wrapper_grads, is_muon_grads = tuple(zip(*muon_results))
+            else:
+                is_muon_grads = (False,) * len(wrapper_grads)
+
+            # update test-time trained parameters
+
+            new_batch_params = dict()
+
+            for (src_name, src_param), (tgt_name, tgt_param), grad, is_muon_grad in zip(source_wrapper.batch_params.items(), target_wrapper.batch_params.items(), wrapper_grads, is_muon_grads):
+                assert src_param.shape == tgt_param.shape, f'source parameter {source_path}.{src_name} (shape {src_param.shape}) and target parameter {target_path}.{tgt_name} (shape {tgt_param.shape}) must have the exact same shape'
+
+                if exists(grad):
+                    lr = self.ttt_muon_lr if is_muon_grad else self.ttt_lr
+                    tgt_param = tgt_param - lr * grad - lr * self.ttt_wd * tgt_param
+
+                if not create_graph:
+                    tgt_param = tgt_param.detach().requires_grad_()
+
+                new_batch_params[tgt_name] = tgt_param
+
+            target_wrapper.batch_params = new_batch_params
 
     @torch.no_grad()
     @eval_decorator
@@ -131,25 +468,52 @@ class XLAutoregressiveWrapper(nn.Module):
         # ps stores the packing specification for unpacking later
         start_tokens, ps = pack([start_tokens], '* n')
 
-        # Get batch size and initial sequence length
-        b, t = start_tokens.shape
+        batch, t = start_tokens.shape
 
-        # Split start_tokens into segments of max_seq_len
-        # all_leading_tokens contains all complete segments except the last (possibly incomplete) one
-        *all_leading_tokens, _ = start_tokens.split(max_seq_len, dim = -1)
+        *all_leading_tokens, remainder_tokens = start_tokens.split(max_seq_len, dim = -1)
+
+        forward_context = torch.enable_grad if self.has_ttt else nullcontext
 
         # Phase 1: Process all leading segments to build up memory
         # This "catches up" the memory to the current position without generating
 
-        for leading_tokens in all_leading_tokens:
-            # Process each leading segment through the network
-            # We only care about updating mems, not the logits
-            _, mems = self.net(
-                leading_tokens,
-                mems = mems,
-                return_mems = True,
-                **kwargs
-            )
+        with forward_context():
+            self.init_ttt(batch)
+
+            for idx, leading_tokens in enumerate(all_leading_tokens):
+                logits, intermediates = self.net(
+                    leading_tokens,
+                    mems = mems,
+                    return_mems = True,
+                    return_intermediates = True,
+                    **kwargs
+                )
+                mems = intermediates.mems
+
+                if not self.has_ttt:
+                    continue
+
+                curr_pos = idx * max_seq_len
+                chunk_labels = start_tokens.narrow(1, curr_pos + 1, max_seq_len)
+                self.update_ttt(logits, chunk_labels, create_graph = False, intermediates = intermediates)
+
+        # test-time train on the remainder of the prompt
+
+        if self.has_ttt and remainder_tokens.shape[-1] > 1:
+            with forward_context():
+                remainder_x = remainder_tokens[:, :-1]
+                remainder_labels = remainder_tokens[:, 1:]
+
+                logits, intermediates = self.net(
+                    remainder_x,
+                    mems = mems,
+                    return_mems = True,
+                    return_intermediates = True,
+                    **kwargs
+                )
+                mems = intermediates.mems
+
+                self.update_ttt(logits, remainder_labels, create_graph = False, intermediates = intermediates)
 
         # Phase 2: Begin autoregressive generation from the current segment
 
@@ -163,21 +527,31 @@ class XLAutoregressiveWrapper(nn.Module):
         # Output starts with all the start_tokens
         out = start_tokens
 
-        # Generate seq_len new tokens one at a time
+        is_greedy = temperature == 0.
+
+        # unwrap episodic memory wrapper to avoid evaluating it per token
+
+        net = self.net
+        if self.has_episodic_mem:
+            kwargs.update(
+                self_attn_additional_kv = net.get_additional_kv(batch)
+            )
+            net = net.net
+
         for _ in range(seq_len):
             # Get the current total sequence length
             curr_segment_len = out.shape[-1]
             # Check if we've reached the end of a segment (divisible by max_seq_len)
             is_last_segment_tokens = divisible_by(curr_segment_len, max_seq_len)
 
-            # Extract tokens from current position onward (current segment being processed)
+            if is_last_segment_tokens:
+                curr_pos = curr_segment_len
+                curr_mems = mems
+                cache = None
+
             x = out[:, curr_pos:]
 
-            # Forward pass through the network
-            # - Use accumulated memories from previous segments
-            # - Use cache for efficient attention within current segment
-            # - return_intermediates gives us cache with mems
-            logits, cache = self.net(
+            logits, cache = net(
                 x,
                 mems = curr_mems,
                 cache = cache,
@@ -191,14 +565,13 @@ class XLAutoregressiveWrapper(nn.Module):
 
             # Get logits for the last position only (next token prediction)
             logits = logits[:, -1]
-            # Apply filtering function (e.g., top-k, top-p) to logits
-            filtered_logits = filter_logits_fn(logits, **filter_kwargs)
-            # Convert filtered logits to probabilities with temperature scaling
-            # Higher temperature = more random, lower temperature = more deterministic
-            probs = F.softmax(filtered_logits / temperature, dim=-1)
 
-            # Sample one token from the probability distribution
-            sample = torch.multinomial(probs, 1)
+            if is_greedy:
+                sample = logits.argmax(dim = -1, keepdim = True)
+            else:
+                filtered_logits = filter_logits_fn(logits, **filter_kwargs)
+                probs = F.softmax(filtered_logits / temperature, dim = -1)
+                sample = torch.multinomial(probs, 1)
 
             # If we've completed a full segment, update position and memories
             if is_last_segment_tokens:
@@ -206,9 +579,9 @@ class XLAutoregressiveWrapper(nn.Module):
                 curr_pos = curr_segment_len
                 # Update current memories to use for next segment
                 curr_mems = mems
+                cache = None
 
-            # Append the sampled token to output sequence
-            out = torch.cat((out, sample), dim=-1)
+            out = torch.cat((out, sample), dim = -1)
 
             # Handle early stopping if end-of-sequence token is specified
             if exists(eos_token):
@@ -217,12 +590,8 @@ class XLAutoregressiveWrapper(nn.Module):
 
                 # Check if all sequences in batch have generated at least one EOS token
                 if is_eos_tokens.any(dim = -1).all():
-                    # Mask out everything after the first EOS token in each sequence
-                    # Shift right by 1 to include the EOS token itself, but mask everything after
-                    shifted_is_eos_tokens = F.pad(is_eos_tokens, (1, -1))
-                    # Cumsum creates mask: 0s before EOS, 1s from EOS onward
-                    mask = shifted_is_eos_tokens.float().cumsum(dim = -1) >= 1
-                    # Replace positions after EOS with pad_value
+                    # mask out everything after the eos tokens
+                    mask = mask_after(out, eos_token, inclusive = False)
                     out = out.masked_fill(mask, self.pad_value)
                     # Stop generation early since all sequences have finished
                     break
@@ -239,33 +608,14 @@ class XLAutoregressiveWrapper(nn.Module):
         self,
         x,
         mems = None,
+        dropout_mems = False,
+        ttt_recurrent_steps = 1,
         **kwargs
     ):
-        """
-        Forward pass for training the Transformer-XL model.
+        if ttt_recurrent_steps > 1:
+            # treating the ttt gradients as the fast weights
+            assert self.has_ttt, 'ttt must be turned on to use ttt_recurrent_steps'
 
-        This method implements the training procedure for autoregressive language modeling.
-        It processes the input sequence in chunks (segments) that fit within max_seq_len,
-        maintaining memory across segments. The loss is computed as a weighted sum across
-        all chunks, where each chunk's weight is proportional to its length.
-
-        The autoregressive training setup:
-        - Input: tokens at positions [0, 1, 2, ..., n-1]
-        - Labels: tokens at positions [1, 2, 3, ..., n]
-        - Each position predicts the next token
-
-        Args:
-            x (torch.Tensor): Input token sequence. Shape: (batch, seq_len)
-                This should include both context and target tokens.
-            mems (optional): Initial memory state from previous segments.
-                If None, starts with no memory. Defaults to None.
-            **kwargs: Additional keyword arguments to pass to the network's forward pass.
-
-        Returns:
-            torch.Tensor: Scalar tensor containing the weighted average cross-entropy loss
-                across all chunks. The loss accounts for varying chunk sizes.
-        """
-        # Extract configuration values
         ignore_index, max_seq_len = self.ignore_index, self.max_seq_len
 
         # Prepare input-label pairs for autoregressive training
@@ -273,8 +623,9 @@ class XLAutoregressiveWrapper(nn.Module):
         # Labels: all tokens except the first one (shifted by 1 position)
         x, labels = x[:, :-1], x[:, 1:]
 
-        # Get total sequence length (after removing last token)
-        seq_len = x.shape[1]
+        batch, seq_len = x.shape[:2]
+
+        self.init_ttt(batch)
 
         # Split sequences into chunks of max_seq_len
         # This is necessary because Transformer-XL has a maximum segment length
@@ -287,37 +638,63 @@ class XLAutoregressiveWrapper(nn.Module):
         # This ensures chunks contribute to loss proportionally to their size
         loss_weights = tuple((t.shape[-1] / seq_len) for t in split_x)
 
-        # Choose appropriate loss function based on model output type
-        # If model outputs log probabilities, use NLL loss; otherwise use cross-entropy
-        loss_fn = F.cross_entropy if not self.net.output_is_log_prob else F.nll_loss
+        loss_fn = F.cross_entropy if not self.output_is_log_prob else F.nll_loss
 
         # Process each chunk and accumulate weighted losses
 
         total_loss = 0.
+        num_chunks = len(split_x)
+        forward_context = torch.enable_grad if self.has_ttt else nullcontext
 
-        # Iterate through all chunks with their labels and weights
-        for chunk, chunk_labels, loss_weight in zip(split_x, split_labels, loss_weights):
+        with forward_context():
+            for idx, (chunk, chunk_labels, loss_weight) in enumerate(zip(split_x, split_labels, loss_weights)):
+                is_last_chunk = (idx == num_chunks - 1)
+                should_detach = divisible_by(idx + 1, self.tbptt_steps)
 
-            # Forward pass through the network for this chunk
-            # mems are automatically updated and passed to next chunk
-            logits, mems = self.net(
-                chunk,
-                mems = mems,
-                return_mems = True,
-                **kwargs
-            )
+                for recurrent_step in range(ttt_recurrent_steps):
+                    is_last_recurrent_step = (recurrent_step == ttt_recurrent_steps - 1)
 
-            # Compute loss for this chunk
-            # Rearrange logits from (batch, seq, classes) to (batch, classes, seq)
-            # as required by PyTorch's cross_entropy function
-            loss = loss_fn(
-                rearrange(logits, 'b n c -> b c n'),
-                chunk_labels,
-                ignore_index = ignore_index
-            )
+                    passed_mems = None if dropout_mems else mems
 
-            # Add weighted loss to total
-            # Weighting ensures fair contribution regardless of chunk size
-            total_loss = total_loss + loss * loss_weight
+                    logits, intermediates = self.net(
+                        chunk,
+                        mems = passed_mems,
+                        return_mems = True,
+                        return_intermediates = True,
+                        detach_mems = should_detach,
+                        **kwargs
+                    )
+
+                    if is_last_recurrent_step:
+                        mems = intermediates.mems
+
+                    loss = loss_fn(
+                        rearrange(logits, 'b n c -> b c n'),
+                        chunk_labels,
+                        ignore_index = ignore_index,
+                        reduction = 'none'
+                    )
+
+                    mask = chunk_labels != ignore_index
+                    loss_per_batch = masked_mean(loss, mask)
+
+                    if is_last_recurrent_step:
+                        total_loss = total_loss + loss_per_batch.mean() * loss_weight
+
+                    if (is_last_chunk and is_last_recurrent_step) or not self.has_ttt:
+                        continue
+
+                    self.update_ttt(logits, chunk_labels, create_graph = self.training, intermediates = intermediates)
+
+                if not should_detach:
+                    continue
+
+                # detach
+
+                for wrapper in self.ttt_wrappers.values():
+                    wrapper.batch_params = tree_map_tensor(
+                        lambda t: t.detach().requires_grad_(t.requires_grad),
+                        wrapper.batch_params
+                    )
 
         return total_loss

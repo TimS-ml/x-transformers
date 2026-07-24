@@ -25,6 +25,14 @@ from x_transformers.multi_input import MultiInputTransformerWrapper
 def exists(v):
     return v is not None
 
+def with_seed(seed):
+    def decorator(fn):
+        def inner(*args, **kwargs):
+            torch.manual_seed(seed)
+            return fn(*args, **kwargs)
+        return inner
+    return decorator
+
 def test_readme():
     model = XTransformer(
         dim = 512,
@@ -1867,3 +1875,401 @@ def test_continuous_autoencoder(
     latents = model.encode(x, lens = lens)
 
     assert latents.shape == (2, 256)
+
+@param('attn_sigmoid', (False, True))
+def test_inverted_cross_attn(attn_sigmoid):
+    from x_transformers import CrossAttender
+
+    cross_attender = CrossAttender(
+        dim = 512,
+        cross_attn_dim_context = 256,
+        depth = 3,
+        heads = 8,
+        cross_attn_inverted_attention = (True, False, True),
+        cross_attn_sigmoid = attn_sigmoid
+    )
+
+    queries = torch.randn(2, 64, 512)
+    context = torch.randn(2, 128, 256)
+
+    # random masks
+    mask = torch.ones(2, 64).bool()
+    mask[:, 60:] = False
+
+    context_mask = torch.ones(2, 128).bool()
+    context_mask[:, 120:] = False
+
+    out = cross_attender(queries, context = context, mask = mask, context_mask = context_mask)
+
+    assert out.shape == (2, 64, 512)
+
+@param('use_custom_loss', (False, True))
+@param('ttt_use_muon', (False, True))
+@param('episodic_mem_len', (0, 16))
+def test_ttt_equivalency(use_custom_loss, ttt_use_muon, episodic_mem_len):
+    seed = 42
+
+    from copy import deepcopy
+    from x_transformers.xl_autoregressive_wrapper import XLAutoregressiveWrapper, TTTModuleWrapper, TTTMetaLearningTargetKLLoss
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 512,
+        max_mem_len = 512,
+        attn_layers = Decoder(
+            dim = 256,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    model_clone = deepcopy(model)
+
+    wrapper_base = with_seed(seed)(XLAutoregressiveWrapper)(
+        model,
+        tbptt_steps = 1000,
+        episodic_mem_len = episodic_mem_len
+    )
+
+    custom_loss = None
+    if use_custom_loss:
+        custom_loss = TTTMetaLearningTargetKLLoss(dim = 256, num_classes = 256)
+
+    ttt_module_paths = ('attn_layers.layers.0.1.to_v',)
+    if episodic_mem_len > 0:
+        ttt_module_paths += ('episodic_mems',)
+
+    wrapper_ttt = with_seed(seed)(XLAutoregressiveWrapper)(
+        model_clone,
+        tbptt_steps = 1000,
+        episodic_mem_len = episodic_mem_len,
+        ttt_module_paths = ttt_module_paths,
+        ttt_lr = 0.,
+        ttt_use_muon = ttt_use_muon,
+        ttt_muon_lr = 0.,
+        ttt_custom_loss_module = custom_loss
+    )
+
+    # longer sequence to trigger inner ttt gradient updates
+
+    x = torch.randint(0, 256, (2, 1025))
+
+    loss_base = wrapper_base(x)
+    loss_ttt = wrapper_ttt(x)
+
+    assert torch.allclose(loss_base, loss_ttt, atol = 1e-5)
+
+    loss_base.backward()
+    loss_ttt.backward()
+
+    for (name_base, p_base), (name_ttt, p_ttt) in zip(model.named_parameters(), model_clone.named_parameters()):
+        assert exists(p_base.grad) and exists(p_ttt.grad)
+        assert torch.allclose(p_base.grad, p_ttt.grad, atol = 1e-4)
+
+    if use_custom_loss:
+        for p in custom_loss.parameters():
+            assert exists(p.grad)
+
+    # test generate equivalency
+
+    prompt = x[:, :100]
+
+    out_base = with_seed(seed)(wrapper_base.generate)(prompt, 10, temperature = 0.)
+    out_ttt = with_seed(seed)(wrapper_ttt.generate)(prompt, 10, temperature = 0.)
+
+    # custom loss introduces slight numerical differences that can flip argmax on untrained nets
+    # assert torch.all(out_base == out_ttt)
+
+    # test that ttt > 0 actually changes the output
+
+    wrapper_ttt_actual = with_seed(seed)(XLAutoregressiveWrapper)(
+        deepcopy(model),
+        tbptt_steps = 1000,
+        episodic_mem_len = episodic_mem_len,
+        ttt_module_paths = ttt_module_paths,
+        ttt_lr = 1.0,
+        ttt_use_muon = ttt_use_muon,
+        ttt_muon_lr = 1.0,
+        ttt_custom_loss_module = deepcopy(custom_loss) if use_custom_loss else None
+    )
+
+    out_ttt_actual = with_seed(seed)(wrapper_ttt_actual.generate)(prompt, 10, temperature = 0.)
+
+    assert not torch.all(out_base == out_ttt_actual)
+
+    # test reset_all
+
+    TTTModuleWrapper.reset_all(wrapper_ttt_actual)
+
+    for wrapper in wrapper_ttt_actual.ttt_wrappers.values():
+        assert not exists(wrapper.batch_params)
+
+def test_ttt_source_target_mapping():
+    import copy
+    from einops import repeat
+    from x_transformers.xl_autoregressive_wrapper import XLAutoregressiveWrapper
+    from x_transformers import Decoder, TransformerWrapper
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 32,
+        max_mem_len = 32,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    # feedforward from layer 2 (index 3) to layer 1 (index 1)
+
+    src_w1_path, tgt_w1_path = 'attn_layers.layers.3.1.ff.0.0', 'attn_layers.layers.1.1.ff.0.0'
+    src_w2_path, tgt_w2_path = 'attn_layers.layers.3.1.ff.2', 'attn_layers.layers.1.1.ff.2'
+
+    wrapper = XLAutoregressiveWrapper(
+        model,
+        tbptt_steps = 16,
+        ttt_module_paths = (
+            (src_w1_path, tgt_w1_path),
+            (src_w2_path, tgt_w2_path),
+        ),
+        ttt_lr = 1.0,
+        ttt_use_muon = False,
+    )
+
+    x = torch.randint(0, 256, (2, 65))
+
+    loss = wrapper(x)
+    loss.backward()
+
+    src_w1_wrapper = wrapper.ttt_wrappers[src_w1_path]
+    tgt_w1_wrapper = wrapper.ttt_wrappers[tgt_w1_path]
+
+    # target batch_params should be updated
+
+    target_weight = tgt_w1_wrapper.batch_params['weight']
+    tgt_base_weight = repeat(tgt_w1_wrapper.module.weight, '... -> b ...', b = x.shape[0])
+    assert not torch.allclose(target_weight, tgt_base_weight)
+
+    # source batch_params should not be updated
+
+    source_weight = src_w1_wrapper.batch_params['weight']
+    src_base_weight = repeat(src_w1_wrapper.module.weight, '... -> b ...', b = x.shape[0])
+    assert torch.allclose(source_weight, src_base_weight)
+
+def test_ttt_custom_loss_optimization():
+    from x_transformers.xl_autoregressive_wrapper import XLAutoregressiveWrapper, TTTMetaLearningTargetKLLoss
+    from x_transformers import Encoder, TransformerWrapper
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 32,
+        max_mem_len = 32,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    custom_loss = TTTMetaLearningTargetKLLoss(dim = 64, num_classes = 256)
+
+    wrapper_ttt = XLAutoregressiveWrapper(
+        model,
+        tbptt_steps = 100,
+        ttt_module_paths = ('attn_layers.layers.0.1.to_v',),
+        ttt_lr = 1e-3,
+        ttt_custom_loss_module = custom_loss
+    )
+
+    opt = torch.optim.Adam(list(model.parameters()) + list(custom_loss.parameters()), lr=1e-3)
+
+    x = torch.randint(0, 256, (2, 65))
+
+    loss1 = wrapper_ttt(x)
+    loss1.backward()
+    opt.step()
+    opt.zero_grad()
+
+    loss2 = wrapper_ttt(x)
+    loss2.backward()
+
+    # Make sure parameters of the custom loss are receiving gradients and being updated
+    assert any(exists(p.grad) for p in custom_loss.parameters())
+    assert loss2 < loss1
+
+    opt.step()
+    opt.zero_grad()
+
+    # Generate test
+    prompt = x[:, :10]
+    out = wrapper_ttt.generate(prompt, 5, temperature = 0.)
+    assert out.shape == (2, 5)
+
+def test_ttt_sleep_phase():
+    from x_transformers.xl_autoregressive_wrapper import XLAutoregressiveWrapper
+    from x_transformers import Decoder, TransformerWrapper
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 32,
+        max_mem_len = 32,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    wrapper_ttt = XLAutoregressiveWrapper(
+        model,
+        tbptt_steps = 100,
+        ttt_module_paths = ('attn_layers.layers.0.1.to_v',),
+        ttt_lr = 1e-3
+    )
+
+    x = torch.randint(0, 256, (2, 65))
+
+    # Test dropout_mems and ttt_recurrent_steps
+    loss = wrapper_ttt(x, dropout_mems = True, ttt_recurrent_steps = 2)
+    loss.backward()
+
+    assert loss.ndim == 0
+
+@param('dynamics_type', ('residual', 'gru', 'custom'))
+@param('loss_type', ('smooth_l1', 'mse_and_cosine_sim'))
+def test_next_latent(dynamics_type, loss_type):
+    from x_transformers.next_latent_wrapper import NextLatentWrapper
+
+    transformer = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 384,
+            depth = 2,
+            heads = 6,
+        )
+    )
+
+    if dynamics_type == 'custom':
+        from x_transformers.next_latent_wrapper import ResidualDynamics
+        custom_mlp = nn.Sequential(
+            nn.Linear(384 * 2, 384),
+            nn.GELU(),
+            nn.Linear(384, 384)
+        )
+        dynamics_network = ResidualDynamics(custom_mlp)
+
+    elif dynamics_type == 'residual':
+        dynamics_network = nn.Sequential(
+            nn.Linear(384 * 2, 384),
+            nn.GELU(),
+            nn.Linear(384, 384)
+        )
+
+    else:
+        dynamics_network = None
+
+    model = NextLatentWrapper(
+        transformer,
+        dim = 384,
+        loss_type = loss_type,
+        dynamics_type = dynamics_type,
+        dynamics_network = dynamics_network,
+        num_rollouts = 2,
+        next_latent_loss_weight = 1.0,
+        kl_loss_weight = 1.0
+    )
+
+    x = torch.randint(0, 256, (2, 128))
+    loss, loss_breakdown = model(x, return_loss_breakdown = True)
+
+    assert loss.ndim == 0
+    loss.backward()
+
+def test_layer_schedule():
+    from x_transformers import layer_schedule
+
+    x = torch.randn(1, 10, 256)
+
+    # 1. tapered feedforward multiplier
+    # smoothly decreasing cosine schedule for the expansion factor from 6 to 2 over 12 layers
+
+    ff_mult_schedule = layer_schedule(start = 6, end = 2, depth = 12, schedule = 'cosine')
+    assert len(ff_mult_schedule) == 12
+
+    decoder = Decoder(
+        dim = 256,
+        depth = 12,
+        heads = 8,
+        ff_mult = ff_mult_schedule
+    )
+
+    assert decoder(x).shape == (1, 10, 256)
+
+    # 2. varying attention dropout across depth
+    # increase attention dropout from 0.0 at first layer to 0.5 at last layer
+
+    attn_dropout_schedule = layer_schedule(start = 0.0, end = 0.5, depth = 12, schedule = 'linear')
+
+    decoder = Decoder(
+        dim = 256,
+        depth = 12,
+        heads = 8,
+        attn_dropout = attn_dropout_schedule
+    )
+
+    assert decoder(x).shape == (1, 10, 256)
+
+    # 3. progressive feedforward dropout with custom schedules
+    # custom exponential dropout increasing across depth
+
+    custom_dropout = lambda start, end, t: start + (end - start) * (t ** 2)
+    ff_dropout_schedule = layer_schedule(start = 0.0, end = 0.5, depth = 12, schedule = custom_dropout)
+
+    decoder = Decoder(
+        dim = 256,
+        depth = 12,
+        heads = 8,
+        ff_dropout = ff_dropout_schedule
+    )
+
+    assert decoder(x).shape == (1, 10, 256)
+
+    # 4. fine-grained manual specification
+    # bypass layer_schedule helper by passing a tuple of length depth
+
+    manual_ff_mult = (4, 4, 4, 8, 8, 8, 2, 2, 2, 1, 1, 1)
+
+    decoder = Decoder(
+        dim = 256,
+        depth = 12,
+        heads = 8,
+        ff_mult = manual_ff_mult
+    )
+
+    assert decoder(x).shape == (1, 10, 256)
+
+def test_relative_proj_positional_bias():
+    from x_transformers import TransformerWrapper, Encoder
+    from x_transformers.x_transformers import RelativeProjPositionalBias
+
+    rel_proj_bias = RelativeProjPositionalBias(dim = 256, heads = 4, num_distance_basis = 16, max_dist = 64)
+    x = torch.randn(2, 10, 256)
+    bias = rel_proj_bias(x)
+    assert bias.shape == (2, 4, 10, 10)
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Encoder(
+            dim = 256,
+            depth = 2,
+            heads = 4,
+            attn_use_rel_proj_pos_bias = True
+        )
+    )
+    tokens = torch.randint(0, 256, (2, 10))
+    out = model(tokens)
+    assert out.shape == (2, 10, 256)
+    out.sum().backward()

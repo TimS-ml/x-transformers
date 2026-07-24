@@ -1,57 +1,27 @@
-"""
-Training script for evaluating entropy-based tokenization on the enwik8 dataset.
-
-This script trains a GPT-like transformer model on the enwik8 dataset (first 100M bytes
-of Wikipedia) while using an entropy-based tokenizer. The entropy-based tokenizer
-dynamically segments text based on the model's prediction entropy, creating variable-length
-tokens where the model is more uncertain.
-
-The script demonstrates:
-- Loading and preparing the enwik8 dataset
-- Training a transformer decoder with rotary positional embeddings
-- Using EntropyBasedTokenizer to segment sequences based on prediction uncertainty
-- Generating text samples with entropy-based token boundaries visualized
-"""
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "x-transformers",
+#     "accelerate",
+#     "fire",
+#     "numpy",
+#     "tqdm"
+# ]
+# ///
 
 from x_transformers import TransformerWrapper, Decoder
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 from x_transformers.entropy_based_tokenizer import EntropyBasedTokenizer
 
 import random
+import fire
 import tqdm
 import gzip
 import numpy as np
 import torch
-import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-
-# constants
-
-# Total number of training batches to process (100,000 iterations)
-NUM_BATCHES = int(1e5)
-
-# Number of sequences to process in each batch
-BATCH_SIZE = 4
-
-# Number of forward passes to accumulate gradients before updating weights
-# Effective batch size = BATCH_SIZE * GRADIENT_ACCUMULATE_EVERY = 16
-GRADIENT_ACCUMULATE_EVERY = 4
-
-# Learning rate for the Adam optimizer
-LEARNING_RATE = 1e-4
-
-# Frequency (in batches) to run validation and print validation loss
-VALIDATE_EVERY  = 100
-
-# Frequency (in batches) to generate sample text with entropy-based tokenization
-GENERATE_EVERY  = 100
-
-# Length of generated text samples (in characters)
-GENERATE_LENGTH = 1024
-
-# Maximum sequence length for training (in characters/tokens)
-SEQ_LEN = 1024
+from accelerate import Accelerator
 
 # helpers
 
@@ -104,49 +74,6 @@ def decode_tokens(tokens):
     """
     return ''.join(list(map(decode_token, tokens)))
 
-# instantiate GPT-like decoder model
-
-# Create the base transformer model
-# num_tokens = 256: vocabulary size (one token per byte value 0-255)
-# max_seq_len = SEQ_LEN: maximum sequence length the model can process
-model = TransformerWrapper(
-    num_tokens = 256,
-    max_seq_len = SEQ_LEN,
-    attn_layers = Decoder(
-        dim = 512,          # Hidden dimension size for embeddings and attention
-        depth = 6,          # Number of transformer layers
-        heads = 8,          # Number of attention heads per layer
-        rotary_pos_emb = True  # Use rotary positional embeddings (RoPE) instead of learned positional embeddings
-    )
-)
-
-# Wrap the model with an entropy-based tokenizer
-# entropy_threshold = 2.5: predictions with entropy above this threshold trigger token boundaries
-# Higher entropy indicates the model is uncertain, suggesting a natural segmentation point
-tokenizer = EntropyBasedTokenizer(
-    model,
-    entropy_threshold = 2.5
-)
-
-# Wrap the model for autoregressive text generation
-# This wrapper handles the forward pass for language modeling (predicting next token)
-model = AutoregressiveWrapper(model)
-
-# Move model to GPU for faster training
-model.cuda()
-
-# prepare enwik8 data
-
-# Load the enwik8 dataset (first 100M bytes of Wikipedia XML)
-# Read 95M bytes total, split into 90M for training and 5M for validation
-with gzip.open('./data/enwik8.gz') as file:
-    # Read data as unsigned 8-bit integers (bytes 0-255)
-    data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-    # Split into training (first 90M bytes) and validation (remaining 5M bytes)
-    train_x, valid_x = np.split(data, [int(90e6)])
-    # Convert numpy arrays to PyTorch tensors
-    data_train, data_val = torch.from_numpy(train_x), torch.from_numpy(valid_x)
-
 class TextSamplerDataset(Dataset):
     """
     Dataset that samples random subsequences from a text corpus.
@@ -183,8 +110,7 @@ class TextSamplerDataset(Dataset):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
         # Extract sequence of length seq_len + 1 (for input and target)
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        # Move to GPU and return
-        return full_seq.cuda()
+        return full_seq
 
     def __len__(self):
         """
@@ -195,73 +121,101 @@ class TextSamplerDataset(Dataset):
         """
         return self.data.size(0) // self.seq_len
 
-# Create dataset instances for training and validation
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
+def train(
+    num_batches: int = int(1e5),
+    batch_size: int = 4,
+    gradient_accumulate_every: int = 4,
+    learning_rate: float = 1e-4,
+    validate_every: int = 100,
+    generate_every: int = 100,
+    seq_len: int = 1024,
+    entropy_threshold: float = 2.5,
+    accumulate_entropy: bool = False,
+    ignore_entropy_below: float = 0.,
+    cpu: bool = False
+):
+    accelerator = Accelerator(cpu=cpu)
+    device = accelerator.device
 
-# Create infinite data loaders using the cycle helper
-# drop_last = True ensures all batches have exactly BATCH_SIZE samples
-train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE, drop_last = True))
-val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE, drop_last = True))
+    # instantiate GPT-like decoder model
 
-# optimizer
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = seq_len,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 6,
+            heads = 8,
+            rotary_pos_emb = True
+        )
+    )
 
-# Initialize Adam optimizer with specified learning rate
-# Adam is used for its adaptive learning rates and momentum properties
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    tokenizer = EntropyBasedTokenizer(
+        model,
+        entropy_threshold = entropy_threshold,
+        accumulate_entropy = accumulate_entropy,
+        ignore_entropy_below = ignore_entropy_below,
+        max_token_size = 4
+    )
 
-# training
+    model = AutoregressiveWrapper(model)
 
-# Main training loop
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
-    # Set model to training mode (enables dropout, etc.)
-    model.train()
+    # prepare enwik8 data
 
-    # Gradient accumulation loop: accumulate gradients over multiple batches
-    # This simulates a larger batch size without requiring more GPU memory
-    for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        # Forward pass: compute loss on next training batch
-        loss = model(next(train_loader))
-        # Backward pass: scale loss by accumulation steps and compute gradients
-        # Scaling ensures the average gradient magnitude is correct
-        (loss / GRADIENT_ACCUMULATE_EVERY).backward()
+    with gzip.open('./data/enwik8.gz') as file:
+        data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+        train_x, valid_x = np.split(data, [int(90e6)])
+        data_train, data_val = torch.from_numpy(train_x), torch.from_numpy(valid_x)
 
-    # Print the training loss (from the last accumulated batch)
-    print(f'training loss: {loss.item()}')
+    train_dataset = TextSamplerDataset(data_train, seq_len)
+    val_dataset   = TextSamplerDataset(data_val, seq_len)
+    train_loader  = DataLoader(train_dataset, batch_size = batch_size, drop_last = True)
+    val_loader    = DataLoader(val_dataset, batch_size = batch_size, drop_last = True)
 
-    # Clip gradients to prevent exploding gradients
-    # Max norm of 0.5 helps stabilize training
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+    # optimizer
 
-    # Update model parameters using accumulated gradients
-    optim.step()
-    # Clear gradients for next iteration
-    optim.zero_grad()
+    opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Validation: periodically evaluate on validation set
-    if i % VALIDATE_EVERY == 0:
-        # Set model to evaluation mode (disables dropout, etc.)
-        model.eval()
-        with torch.no_grad():  # Disable gradient computation for efficiency
-            # Compute loss on validation batch
-            loss = model(next(val_loader))
-            print(f'validation loss: {loss.item()}')
+    # prepare with accelerate
 
-    # Text generation: periodically generate samples with entropy-based tokenization
-    if i % GENERATE_EVERY == 0:
-        model.eval()
-        # Select a random validation sequence (remove last token for prompting)
-        inp = random.choice(val_dataset)[:-1]
+    model, opt, train_loader, val_loader = accelerator.prepare(
+        model, opt, train_loader, val_loader
+    )
 
-        # Apply entropy-based tokenizer to segment the sequence
-        # return_segmented_seq = True returns a list of token segments
-        # where boundaries are placed at high-entropy positions
-        tokens = tokenizer(inp, return_segmented_seq = True)
+    train_loader = cycle(train_loader)
+    val_loader = cycle(val_loader)
 
-        # Use a visual delimiter to show where token boundaries occur
-        delimiter = " \u275A "  # Unicode character for vertical bar
-        # Decode each token segment and join with delimiter
-        output_str = delimiter.join([decode_tokens(token) for token in tokens])
+    # training
 
-        # Print the segmented output showing entropy-based token boundaries
-        print(f"{output_str}\n\n")
+    for i in tqdm.tqdm(range(num_batches), mininterval=10., desc='training'):
+        model.train()
+
+        for __ in range(gradient_accumulate_every):
+            loss = model(next(train_loader))
+            accelerator.backward(loss / gradient_accumulate_every)
+
+        print(f'training loss: {loss.item()}')
+        accelerator.clip_grad_norm_(model.parameters(), 0.5)
+        opt.step()
+        opt.zero_grad()
+
+        if i % validate_every == 0:
+            model.eval()
+            with torch.no_grad():
+                loss = model(next(val_loader))
+                print(f'validation loss: {loss.item()}')
+
+        if i % generate_every == 0:
+            model.eval()
+            inp = random.choice(val_dataset)[:-1].to(device)
+
+            with torch.no_grad():
+                tokens = tokenizer(inp, return_segmented_seq = True)
+
+            delimiter = " \u275A "
+            output_str = delimiter.join([decode_tokens(token.tolist()) for token in tokens])
+
+            print(f"{output_str}\n\n")
+
+if __name__ == '__main__':
+    fire.Fire(train)

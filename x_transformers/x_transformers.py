@@ -26,7 +26,7 @@ from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, pack, unpack
-from torch_einops_utils import masked_mean, pad_at_dim, safe_cat
+from torch_einops_utils import masked_mean, pad_at_dim, safe_cat, tree_map_tensor
 from torch_einops_utils.nn import Sequential, Lambda, Identity
 
 # einstein notation
@@ -132,7 +132,18 @@ class equals():
     def __call__(self, x, *args, **kwargs):
         return x == self.val
 
+# layer schedules
 
+def layer_schedule(start, end, depth, schedule = 'cosine'):
+    assert callable(schedule) or schedule in ('linear', 'cosine'), 'schedule must be a callable or one of linear or cosine'
+    assert depth > 1, 'depth must be greater than 1 for tapering'
+
+    if schedule == 'linear':
+        schedule = lambda start, end, t: start + (end - start) * t
+    elif schedule == 'cosine':
+        schedule = lambda start, end, t: start + (end - start) * 0.5 * (1 - math.cos(math.pi * t))
+
+    return tuple(schedule(start, end, l / (depth - 1)) for l in range(depth))
 
 # recurrent depth related
 
@@ -789,6 +800,49 @@ class PerRowDataDependentAlibi(Module):
         forget_gates = forget_gates.flip(dims = (-1,))
 
         return forget_gates
+
+class RelativeProjPositionalBias(Module):
+    """
+    relative position bias via learned distance basis projection (Inkling model from Thinking Machines, no paper yet)
+    """
+
+    def __init__(
+        self,
+        dim,
+        heads,
+        num_distance_basis = 16,
+        max_dist = 1024
+    ):
+        super().__init__()
+        self.heads = heads
+        self.num_distance_basis = num_distance_basis
+        self.max_dist = max_dist
+
+        self.to_distance_weights = nn.Sequential(
+            nn.Linear(dim, heads * num_distance_basis),
+            Rearrange('b n (h d) -> b h n d', h = heads)
+        )
+
+        self.distance_bank = nn.Parameter(torch.randn(num_distance_basis, max_dist) * 0.02)
+
+    def forward(self, x, seq_len_k = None):
+        b, n, device, h = x.shape[0], x.shape[1], x.device, self.heads
+        seq_len_k = default(seq_len_k, n)
+
+        pos_q = torch.arange(n, device = device) + (seq_len_k - n)
+        pos_k = torch.arange(seq_len_k, device = device)
+
+        rel_dist = einx.subtract('i, j -> i j', pos_q, pos_k)
+
+        valid_mask = (rel_dist >= 0) & (rel_dist < self.max_dist)
+        clamped_dist = rel_dist.clamp(0, self.max_dist - 1)
+
+        weights = self.to_distance_weights(x)
+
+        curves = einsum('b h n d, d r -> b h n r', weights, self.distance_bank)
+
+        bias = curves.gather(-1, repeat(clamped_dist, 'i j -> b h i j', b = b, h = h))
+        return bias.masked_fill(~valid_mask, 0.)
 
 class RotaryEmbedding(Module):
     def __init__(
@@ -1860,6 +1914,9 @@ class Attention(Module):
         data_dependent_alibi_per_row = False,
         data_dependent_alibi_per_row_dim_head = 8,
         data_dependent_alibi_kwargs: dict = dict(),
+        use_rel_proj_pos_bias = False,
+        rel_proj_num_distance_basis = 16,
+        rel_proj_max_dist = 1024,
         use_cope = False,
         cope_max_pos = 16,
         cope_soft_onehot_pos = False,
@@ -1879,6 +1936,7 @@ class Attention(Module):
         dim_latent_kv = None,
         latent_rope_subheads = None,
         onnxable = False,
+        inverted_attention = False,
         attend_sdp_kwargs: dict = dict(
             enable_flash = True,
             enable_math = True,
@@ -2044,6 +2102,18 @@ class Attention(Module):
 
             self.data_dependent_alibi = dda_klass(**dda_kwargs, **data_dependent_alibi_kwargs)
 
+        # relative projection positional bias (Inkling)
+
+        self.rel_proj_pos_bias = None
+
+        if use_rel_proj_pos_bias:
+            self.rel_proj_pos_bias = RelativeProjPositionalBias(
+                dim = dim,
+                heads = heads,
+                num_distance_basis = rel_proj_num_distance_basis,
+                max_dist = rel_proj_max_dist
+            )
+
         # attend class - includes core attention algorithm + talking heads
 
         self.attend = Attend(
@@ -2073,6 +2143,7 @@ class Attention(Module):
             logit_softclamp_value = logit_softclamp_value,
             cope = cope,
             onnxable = onnxable,
+            inverted_attention = inverted_attention,
             sdp_kwargs = attend_sdp_kwargs,
             flash_pack_seq=flash_pack_seq,
         )
@@ -2504,6 +2575,17 @@ class Attention(Module):
 
             attn_bias = pad_at_dim(attn_bias, (num_mem_kv, 0))
 
+        # relative projection positional bias (Inkling)
+
+        if exists(self.rel_proj_pos_bias):
+            seq_len_k = k.shape[-2]
+            rel_proj_bias = self.rel_proj_pos_bias(q_input, seq_len_k = seq_len_k)
+            attn_bias = rel_proj_bias if not exists(attn_bias) else (attn_bias + rel_proj_bias)
+
+            attn_bias = pad_at_dim(attn_bias, (num_mem_kv, 0))
+
+        # laser
+
         if self.laser:
             v = softclamp(v, self.laser_softclamp_value)
             v = v.exp()
@@ -2517,6 +2599,7 @@ class Attention(Module):
             attn_bias = attn_bias,
             prev_attn = prev_attn,
             attn_delta = attn_delta,
+            row_mask = mask,
             flash_pack_seq_kwargs = flash_pack_seq_kwargs,
             causal = causal,
         )
@@ -2972,6 +3055,8 @@ class AttentionLayers(Module):
         assert all([i < len(self.layer_types) for i in self.layers_execute_order])
 
         self.num_attn_layers = len(list(filter(equals('a'), layer_types)))
+        self.num_cross_attn_layers = len(list(filter(equals('c'), layer_types)))
+        self.num_ff_layers = len(list(filter(equals('f'), layer_types)))
 
         # set the depth
 
@@ -3022,8 +3107,32 @@ class AttentionLayers(Module):
         self.add_value_residual = add_value_residual
 
         is_first_self_attn = True
-        is_first_cross_attn = True
         learned_value_residual_mix &= add_value_residual
+
+        attn_kwargs.pop('inverted_attention', None)
+
+        # inverted attention
+        # https://openreview.net/forum?id=WgQZNoQ5AB
+
+        cross_attn_inverted_attentions = cast_tuple(cross_attn_kwargs.pop('inverted_attention', False), self.num_cross_attn_layers)
+
+        if causal and any(cross_attn_inverted_attentions):
+            logger.warning('causal attention is not compatible with inverted cross attention')
+
+        cross_attn_inverted_attention_iter = iter(cross_attn_inverted_attentions)
+
+        # prepare kwargs iterators
+        # deferred until here so explicitly popped kwargs are removed
+
+        def create_layer_kwargs_iter(kwargs, length):
+            return iter([{k: (v[i] if isinstance(v, tuple) and len(v) == length else v) for k, v in kwargs.items()} for i in range(length)])
+
+        attn_kwargs_for_cross = {k: v for k, v in attn_kwargs.items() if not (isinstance(v, tuple) and len(v) == self.num_attn_layers)}
+        cross_attn_kwargs_merged = {**attn_kwargs_for_cross, **cross_attn_kwargs}
+
+        attn_kwargs_iter = create_layer_kwargs_iter(attn_kwargs, self.num_attn_layers)
+        cross_attn_kwargs_iter = create_layer_kwargs_iter(cross_attn_kwargs_merged, self.num_cross_attn_layers)
+        ff_kwargs_iter = create_layer_kwargs_iter(ff_kwargs, self.num_ff_layers)
 
         # iterate and construct layers
 
@@ -3035,8 +3144,6 @@ class AttentionLayers(Module):
             block_begin = divisible_by(ind, len_default_block)
             block_ind = ind // len_default_block
 
-            is_last_layer = ind == (len(self.layer_types) - 1)
-
             # attention, cross attention, feedforward
 
             layer_qkv_receives_diff_view = layer_type == 'a' and qkv_receive_diff_residuals and not (is_first_self_attn and integrate_layers)
@@ -3044,15 +3151,14 @@ class AttentionLayers(Module):
             if layer_type == 'a':
                 self_attn_learned_value_residual = learned_value_residual_mix and not is_first_self_attn
 
-                layer = Attention(dim, heads = heads, causal = causal, qkv_receive_diff_residuals = layer_qkv_receives_diff_view, learned_value_residual_mix = self_attn_learned_value_residual, rotate_num_heads = rotate_num_heads, **attn_kwargs)
+                layer = Attention(dim, heads = heads, causal = causal, qkv_receive_diff_residuals = layer_qkv_receives_diff_view, learned_value_residual_mix = self_attn_learned_value_residual, rotate_num_heads = rotate_num_heads, **next(attn_kwargs_iter))
                 is_first_self_attn = False
 
             elif layer_type == 'c':
-                layer = Attention(dim, heads = heads, **{**attn_kwargs, **cross_attn_kwargs})
-                is_first_cross_attn = False
+                layer = Attention(dim, heads = heads, inverted_attention = next(cross_attn_inverted_attention_iter), **next(cross_attn_kwargs_iter))
 
             elif layer_type == 'f':
-                layer = FeedForward(dim, **ff_kwargs)
+                layer = FeedForward(dim, **next(ff_kwargs_iter))
                 layer = layer if not macaron else Scale(0.5, layer)
 
             else:
@@ -4026,6 +4132,7 @@ class TransformerWrapper(Module):
         return_attn = False,
         mems = None,
         mem_masks = None,
+        detach_mems = True,
         recycle_steps = None,
         looped_steps = None,
         max_looped_steps = None,
@@ -4222,6 +4329,8 @@ class TransformerWrapper(Module):
 
             looped_inference_and_is_prompt = looped_inference and not exists(cache) and looped_num_tokens > 1
 
+            assert not (looped_inference and b > 1), 'looped inference does not support batch sizes greater than 1'
+
             # looped training
 
             all_pred_logits = []
@@ -4230,7 +4339,6 @@ class TransformerWrapper(Module):
             # all intermediates gathered for special prompt recurrent kv cache handling
 
             all_intermediates = []
-
             # loop
 
             for i in range(max_looped_steps):  # each iteration is one application of the full layer stack
@@ -4470,7 +4578,11 @@ class TransformerWrapper(Module):
         if return_mems:
             hiddens = intermediates.hiddens
             new_mems = [cat(pair, dim = -2) for pair in zip(mems, hiddens)] if exists(mems) else hiddens
-            new_mems = [t[..., -self.max_mem_len:, :].detach() for t in new_mems]
+
+            new_mems = [t[..., -self.max_mem_len:, :] for t in new_mems]
+
+            if detach_mems:
+                new_mems = tree_map_tensor(lambda t: t.detach(), new_mems)
 
             if not return_intermediates:
                 return out, new_mems
