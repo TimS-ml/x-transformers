@@ -573,6 +573,10 @@ class AutoregressiveWrapper(Module):
         for i in range(seq_len):
             is_first = i == 0
 
+            # default to the whole sequence so far - before upstream added this line, `x` was
+            # only bound inside the branch below, so restrict_to_max_seq_len = False raised NameError
+            x = out
+
             # Restrict sequence length to model's maximum if needed
             if restrict_to_max_seq_len:
                 max_len_exceeded = out.shape[-1] > max_seq_len
@@ -580,7 +584,7 @@ class AutoregressiveWrapper(Module):
                 assert not (cache_kv and max_len_exceeded and not self.net.can_cache_kv_outside_max_seq_len), 'the network cannot use cached key values when decoding outside the max sequence length. most likely because you are using absolute positional embedding. you can switch to rotary embeddings to resolve this issue'
 
                 # Only use the last max_seq_len tokens
-                x = out[:, -max_seq_len:]
+                x = x[:, -max_seq_len:]
 
                 # Truncate cache to match
                 if exists(cache):
@@ -652,6 +656,10 @@ class AutoregressiveWrapper(Module):
 
                 # Keep only top beam sequences
                 out = out[flattened_beam_indices]
+
+                if should_cache:
+                    parent_beam_indices = flattened_beam_indices // beams
+                    modify_cached_kv(cache, lambda t: t[parent_beam_indices])
 
             scores = rearrange(scores, 'b beams -> (b beams)')
 

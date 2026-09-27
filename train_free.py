@@ -23,6 +23,7 @@ Task: Character-level language modeling with latent variables
 # ///
 
 from x_transformers.free_transformer import FreeTransformer
+from x_transformers import default_device
 
 from math import log
 import random
@@ -56,6 +57,9 @@ SEQ_LEN = 512  # Maximum sequence length for training samples
 # VAE latent space configuration
 LATENT_BITS = 8  # Number of bits for latent representation (2^8 = 256 possible discrete latent codes)
 NAT = log(2)  # Natural unit of information (1 bit in nats), used as KL divergence threshold
+
+# Pick the best available accelerator (xpu > cuda > mps > cpu), see default_device
+DEVICE = default_device()
 
 # ============================================================================
 # Helper Functions
@@ -122,7 +126,7 @@ model = FreeTransformer(
     per_token_latents = True,  # Use per-token latent codes instead of sequence-level
     kl_loss_threshold = NAT,  # Threshold for KL loss (information bottleneck in nats)
     latent_bits = LATENT_BITS  # Bits for discrete latent representation
-).cuda()
+).to(DEVICE)
 
 # Random latent code for conditioned text generation during evaluation
 one_hot_indices = torch.randint(0, 2 ** LATENT_BITS, ())
@@ -177,7 +181,7 @@ class TextSamplerDataset(Dataset):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
         # Extract sequence of length seq_len + 1 (input + target)
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        return full_seq.to(DEVICE)
 
     def __len__(self):
         """

@@ -30,7 +30,8 @@ from x_transformers.x_transformers import (
     LayerNorm,
     masked_mean,
     always,
-    pad_at_dim
+    pad_at_dim,
+    slice_right_at_dim
 )
 
 # helper functions
@@ -53,8 +54,10 @@ def sample_from_mean_variance(
     std = variance.clamp(min = eps).sqrt()
     return torch.normal(mean, std * temperature)
 
-def masked_mean(t, mask):
-    # mean over the sequence dim, ignoring masked-out positions (den clamped to avoid div-by-zero)
+def batch_masked_mean(t, mask):
+    # one scalar per sample: sum over the feature dim, averaged over the unmasked positions
+    # (den clamped to avoid div-by-zero). renamed from `masked_mean` upstream: the local def
+    # shadowed the imported masked_mean, so average_pool_embed got (b,) back instead of (b, d)
     t = einx.where('b n, b n d, -> b n d', mask, t, 0.)
 
     num = reduce(t, 'b n d -> b', 'sum')
@@ -262,7 +265,7 @@ class ContinuousTransformerWrapper(Module):
             intermediates.memory_tokens = m
 
         if self.average_pool_embed:
-            x = masked_mean(x, mask = orig_mask)
+            x = masked_mean(x, mask = orig_mask, dim = 1)
 
         # maybe linear project out
 
@@ -280,7 +283,7 @@ class ContinuousTransformerWrapper(Module):
 
         if return_mems:
             hiddens = intermediates.hiddens
-            new_mems = tuple(t[..., -self.max_mem_len:, :].detach() for t in hiddens)
+            new_mems = tuple(slice_right_at_dim(t, self.max_mem_len, dim = -2).detach() for t in hiddens)
             return out, new_mems
 
         if return_attn:
@@ -545,7 +548,7 @@ class ContinuousAutoregressiveWrapper(Module):
             # equal_loss_weight_batch: average per-sequence first so each sample counts equally;
             # otherwise just gather the unmasked positions
             if self.equal_loss_weight_batch:
-                loss = masked_mean(loss, mask)
+                loss = batch_masked_mean(loss, mask)
             else:
                 loss = loss[mask]
 

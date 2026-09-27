@@ -20,13 +20,21 @@ from torch.nn import Module, ModuleList, ModuleDict
 
 from loguru import logger
 
-from x_transformers.attend import Attend, Intermediates, pack_one, unpack_one, log_prob_from_hard_attend
-from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
+from x_transformers.attend import Attend, Intermediates, pack_one, unpack_one, log_prob_from_hard_attend, default_device
 
 import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, pack, unpack
-from torch_einops_utils import masked_mean, pad_at_dim, safe_cat, tree_map_tensor
+
+from torch_einops_utils import (
+    masked_mean,
+    pad_at_dim,
+    safe_cat,
+    slice_right_at_dim,
+    tree_flatten_with_inverse,
+    tree_map_tensor
+)
+
 from torch_einops_utils.nn import Sequential, Lambda, Identity
 
 # einstein notation
@@ -40,6 +48,7 @@ from torch_einops_utils.nn import Sequential, Lambda, Identity
 # constants
 
 DEFAULT_DIM_HEAD = 64
+DEFAULT_ATTN_RESIDUAL_LORA_RANK = 64
 
 @dataclass
 class LayerIntermediates:
@@ -59,6 +68,7 @@ class LayerIntermediates:
     all_pred_logits:        list[Tensor] | None = None
     exit_indices:           Tensor | None = None
     looped_prompt_kv_cache: tuple[Tensor, Tensor] | None = None
+    block_hiddens:          list[Tensor] | None = None
     cache_length:           int = 0
 
     def __copy__(self):
@@ -67,7 +77,12 @@ class LayerIntermediates:
         if exists(self.attn_intermediates):
             out.attn_intermediates = [copy(inter) for inter in self.attn_intermediates]
 
+        if exists(self.block_hiddens):
+            out.block_hiddens = copy(self.block_hiddens)
+
         return out
+
+from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 
 LinearNoBias = partial(nn.Linear, bias = False)
 
@@ -75,6 +90,16 @@ LinearNoBias = partial(nn.Linear, bias = False)
 
 def exists(val):
     return val is not None
+
+def disable_autocast(fn):
+    @wraps(fn)
+    def inner(*args, **kwargs):
+        tensor_arg = next(arg for arg in (*args, *kwargs.values()) if is_tensor(arg))
+
+        with autocast(tensor_arg.device.type, enabled = False):
+            return fn(*args, **kwargs)
+
+    return inner
 
 def default(*args):
     for arg in args:
@@ -327,6 +352,12 @@ def init_zero_(layer):
     nn.init.constant_(layer.weight, 0.)
     if exists(layer.bias):
         nn.init.constant_(layer.bias, 0.)
+
+def init_depth_scaled_(projection, layer_depth):
+    # depth scaling of the residual branch output projection, as in the olmo 'mitchell' init
+    # std = 1 / sqrt(2 * fan_in * layer_depth)
+
+    nn.init.normal_(projection.weight, std = (2 * projection.in_features * layer_depth) ** -0.5)
 
 # keyword argument helpers
 
@@ -916,7 +947,7 @@ class RotaryEmbedding(Module):
         t = arange(seq_len, device = device)
         return self.forward(t)
 
-    @autocast('cuda', enabled = False)
+    @disable_autocast
     def forward(self, t, offset = 0):
         max_pos = t.max() + 1
 
@@ -943,7 +974,7 @@ def rotate_half(x):
     x = stack((-x2, x1), dim = -1)
     return rearrange(x, '... d r -> ... (d r)')
 
-@autocast('cuda', enabled = False)
+@disable_autocast
 def apply_rotary_pos_emb(t, freqs, scale = 1):
     rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
 
@@ -990,7 +1021,7 @@ class PolarEmbedding(Module):
         if bias_uniform_init:
             self.learned_bias.uniform_(-2. * math.pi, 0.)
 
-    @autocast('cuda', enabled = False)
+    @disable_autocast
     def forward(self, t, offset = 0):
         max_pos = t.max() + 1
 
@@ -1003,7 +1034,7 @@ class PolarEmbedding(Module):
 
         return freqs, bias
 
-@autocast('cuda', enabled = False)
+@disable_autocast
 def apply_polar_pos_emb(t, freqs):
     rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
     freqs = freqs[:, -seq_len:]
@@ -1015,22 +1046,59 @@ def apply_polar_pos_emb(t, freqs):
 
     return out.type(orig_dtype)
 
-# norms
+# lora
+
+class LoRALinear(Module):
+    """ low-rank linear projection with optional activation in the middle (silu for the HyGA gates), or a bias-less linear when no rank is given """
+
+    def __new__(cls, dim_in, dim_out = None, dim = None, activation = None):
+        dim_out = default(dim_out, dim_in)
+
+        if not exists(dim):
+            linear = LinearNoBias(dim_in, dim_out)
+            init_zero_(linear)
+            return linear
+
+        return super().__new__(cls)
+
+    def __init__(
+        self,
+        dim_in,
+        dim_out = None,
+        dim = None,
+        activation = None
+    ):
+        super().__init__()
+        dim_out = default(dim_out, dim_in)
+        assert dim < dim_in or dim < dim_out, f'rank ({dim}) must be less than either input ({dim_in}) or output ({dim_out}) dimension'
+        self.down = LinearNoBias(dim_in, dim)
+        self.up = LinearNoBias(dim, dim_out)
+        init_zero_(self.up)
+        self.maybe_activation = activation if exists(activation) else identity
+
+    def forward(self, x):
+        return self.up(self.maybe_activation(self.down(x)))
+
+# helper modules
 
 class Scale(Module):
-    def __init__(self, value, fn):
+    def __init__(self, scale, fn: Module | None = None):
         super().__init__()
-        self.value = value
-        self.fn = fn
+        self.scale = scale
+        self.fn = fn if exists(fn) else nn.Identity()
 
-    def forward(self, x, **kwargs):
-        out = self.fn(x, **kwargs)
-        scale_fn = lambda t: t * self.value
+    def forward(self, *args, **kwargs):
+        out = self.fn(*args, **kwargs)
 
-        if not isinstance(out, tuple):
-            return scale_fn(out)
+        if not exists(self.scale) or self.scale == 1.:
+            return out
 
-        return (scale_fn(out[0]), *out[1:])
+        tensors, inverse = tree_flatten_with_inverse(out)
+        first, *rest = tensors
+
+        return inverse([first * self.scale, *rest])
+
+# norms
 
 class LayerNorm(Module):
     def __init__(
@@ -1341,15 +1409,31 @@ class MVSplitResidualUpdate(Module):
         # residual + beta * (high-freq part) + alpha * (shift in means)
         return residual + centered_x * beta + (mean_x - mean_residual) * alpha
 
-class AttentionAggregatedResidual(Module):
+# attention residual
+
+class AttentionResidual(Module):
     """
-    Attention-aggregated residual - instead of taking the residual as just the
-    previous layer's output, an attention-pool gathers information across ALL prior
-    layer hiddens (per token position) to form the residual to add back. The current
-    hiddens `x` can be projected into the queries (`last_layer_hiddens_as_query`),
-    and rotary/polar positional embeddings encode the *layer-depth distance* so the
-    pool is aware of how far back each hidden came from. `num_views` lets it produce
-    several aggregated residuals.
+    Attention over all preceding hiddens, with the query conditioned on the latest hidden
+    through a low-rank residual, so that the pooling stays sensitive to the current state.
+
+    Depth-wise attention residual: in the `layer_integrate` slot, each layer's input is
+    replaced by a softmax-weighted mix of every hidden seen so far at the same token
+    position. AttentionLayers calls it as `layer_integrator(x, layer_hiddens)`; the
+    positional `x` is overwritten by `args[0]`, and the last entry of `layer_hiddens` is
+    the current `x`, so nothing is lost.
+
+      query  = RMSNorm(latest + LoRA(RMSNorm(latest)))   one per view
+      keys   = RMSNorm(each stacked hidden)              no projection
+      values = the raw stacked hiddens
+      softmax over the depth axis `l`, independently per token
+
+    LoRALinear zero-inits its up-projection, so at init the query is just the normalized
+    latest hidden. `num_views = 3` yields separate q / k / v inputs for an attention
+    layer with `qkv_receive_diff_residuals`.
+
+    Replaces the earlier AttentionAggregatedResidual (an AttentionPool with rotary or
+    polar embeddings of layer-depth distance): b9222c7 renamed and rewrote it, and 96d46fa
+    settled on the rmsnorm -> lora + residual -> rmsnorm query shown above.
     https://arxiv.org/abs/2601.21582
     https://arxiv.org/abs/2603.15031
     """
@@ -1358,97 +1442,61 @@ class AttentionAggregatedResidual(Module):
         self,
         dim,
         num_views = 1,
-        heads = 4,
-        dim_head = 64,
-        rotary_pos_emb = True,
-        polar_pos_emb = False,
-        last_layer_hiddens_as_query = True,
-        attn_kwargs: dict = dict(),
+        lora_rank = DEFAULT_ATTN_RESIDUAL_LORA_RANK,
+        lora_activation = None,
         **kwargs
     ):
         super().__init__()
-        assert at_most_one_of(rotary_pos_emb, polar_pos_emb), 'either rotary or polar positional embedding can be used, not both'
-
-        attn_kwargs = dict(
-            k_rmsnorm = True,
-            **attn_kwargs
-        )
+        self.scale = dim ** -0.5
 
         self.num_views = num_views
         self.multiple_views = num_views > 1
-        self.last_layer_hiddens_as_query = last_layer_hiddens_as_query
 
-        self.attn_pool = AttentionPool(
-            dim = dim,
-            dim_context = dim,
-            num_pooled_tokens = num_views if not last_layer_hiddens_as_query else 0,
-            use_transformer_blocks = False,
-            heads = heads,
-            dim_head = dim_head,
-            attn_kwargs = attn_kwargs
+        lora_rank = default(lora_rank, DEFAULT_ATTN_RESIDUAL_LORA_RANK)
+        assert lora_rank < dim, f'lora_rank ({lora_rank}) must be less than dim ({dim})'
+
+        self.to_keys = nn.RMSNorm(dim)
+
+        self.to_query = nn.Sequential(
+            nn.RMSNorm(dim),
+            LoRALinear(dim, dim_out = dim * num_views, dim = lora_rank, activation = lora_activation)
         )
 
-        self.to_queries = None
-
-        if last_layer_hiddens_as_query:
-            self.to_queries = nn.Sequential(
-                nn.RMSNorm(dim),
-                nn.Linear(dim, dim * num_views, bias = False),
-                Rearrange('b n (v d) -> (b n) v d', v = num_views)
-            )
-
-        self.use_rotary = rotary_pos_emb
-        self.use_polar = polar_pos_emb
-
-        if polar_pos_emb:
-            self.pos_emb = PolarEmbedding(dim_head, heads)
-        elif rotary_pos_emb:
-            self.pos_emb = RotaryEmbedding(dim_head)
-        else:
-            self.pos_emb = None
+        self.norm = nn.RMSNorm(dim)
 
     def forward(
         self,
-        x,
-        hiddens: list[Tensor] | None = None,
-        **kwargs
+        past_deltas: list[Tensor] | Tensor | None = None,
+        *args,
+        hiddens: list[Tensor] | Tensor | None = None
     ):
-        assert exists(hiddens), 'hiddens must be passed to AttentionAggregatedResidual'
+        if exists(hiddens):
+            past_deltas = hiddens
+        elif len(args) > 0:
+            past_deltas = args[0]
 
-        hiddens = stack(hiddens, dim = 1)
-
-        hiddens = rearrange(hiddens, 'b l n d -> b n l d')
-        hiddens, packed_shape = pack_one(hiddens, '* l d')
-
-        # positional embeddings for layer depth distance
-
-        attn_kwargs = dict()
-
-        if exists(self.pos_emb):
-            num_layers = hiddens.shape[-2]
-            positions = arange(num_layers, device = x.device)
-            pos_emb = self.pos_emb(positions)
-
-            if self.use_polar:
-                attn_kwargs.update(polar_pos_emb = pos_emb)
-            else:
-                attn_kwargs.update(rotary_pos_emb = pos_emb, context_rotary_pos_emb = pos_emb)
-
-        queries = None
-
-        if self.last_layer_hiddens_as_query:
-            queries = self.to_queries(x)
-
-        pooled = self.attn_pool(hiddens, queries = queries, **attn_kwargs)
-
-        if self.multiple_views:
-            pooled = rearrange(pooled, '... v d -> v ... d', v = self.num_views)
-            pooled = unpack_one(pooled, packed_shape, 'v * d')
+        if not is_tensor(past_deltas):
+            stacked = torch.stack(list(past_deltas), dim = 0)
         else:
-            pooled = rearrange(pooled, '... 1 d -> ... d')
-            pooled = unpack_one(pooled, packed_shape, '* d')
+            stacked = past_deltas
 
-        return pooled
+        latest = stacked[-1]
+
+        query = rearrange(latest, '... d -> 1 ... d')
+        query_delta = rearrange(self.to_query(latest), '... (v d) -> v ... d', v = self.num_views)
+
+        query = self.norm(query + query_delta)
+        keys = self.to_keys(stacked)
+
+        logits = einsum('v b ... d, l b ... d -> v l b ...', query, keys) * self.scale
+        weights = logits.softmax(dim = 1)
+
+        out = einsum('v l b ..., l b ... d -> v b ... d', weights, stacked)
+
+        if not self.multiple_views:
+            out = rearrange(out, '1 ... -> ...')
+
+        return out
 
 # hyper connections
 
@@ -1572,6 +1620,89 @@ class HyperConnection(Module):
         # depth-connection: broadcast block output x into every stream, weighted by beta
         residuals = einsum('b n d, b n s -> b n s d', x, beta) + residuals
         return rearrange(residuals, 'b n s d -> (b s) n d')  # re-pack streams into batch
+
+# gated multi residual
+
+class GatedMultiResidual(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        layer_index,
+        num_residual_streams,
+        num_input_views = 1,
+        read_gate_rank = None,
+        **kwargs
+    ):
+        """
+        https://qwen.ai/blog?id=qwen3.8-flash-next
+
+        Gated residual - elementwise low rank read gate over the residual streams, per stream scalar write gate
+        """
+        super().__init__()
+
+        self.num_residual_streams = num_residual_streams
+        self.num_input_views = num_input_views
+
+        assert exists(read_gate_rank), 'read_gate_rank must be provided for the gated multi residual'
+
+        # normalization and per stream elementwise gain
+
+        self.read_norm = nn.RMSNorm(dim, elementwise_affine = False)
+        self.read_gain = nn.Parameter(torch.ones(num_residual_streams, dim))
+
+        # static read gate - identity anchored on the layer's own stream
+
+        static_read_logit = torch.zeros(num_input_views, num_residual_streams, dim)
+        static_read_logit[:, layer_index % num_residual_streams] = 1.
+
+        self.static_read_logit = nn.Parameter(static_read_logit)
+
+        # static write gate - identity at init (sigmoid of zero times two is one)
+
+        self.static_write_logit = nn.Parameter(torch.zeros(num_residual_streams))
+
+        # shared low rank bottleneck for the read and write gates, zero initialized so both start at their static values
+
+        self.to_bottleneck = LinearNoBias(dim * num_residual_streams, read_gate_rank)
+        self.to_read_gate = LinearNoBias(read_gate_rank, dim * num_residual_streams * num_input_views)
+        self.to_write_gate = LinearNoBias(read_gate_rank, num_residual_streams)
+
+        init_zero_(self.to_read_gate)
+        init_zero_(self.to_write_gate)
+
+        self.dynamic_gate_scale = nn.Parameter(torch.ones(()) * 1e-2)
+
+    def prepare(self, residuals):
+        streams = self.num_residual_streams
+        views = self.num_input_views
+
+        residuals = rearrange(residuals, '(b s) n d -> b n s d', s = streams)
+
+        normed = self.read_norm(residuals) * self.read_gain
+        flat = rearrange(normed, 'b n s d -> b n (s d)') / streams
+
+        # shared low rank bottleneck for the read and write gates
+
+        dynamic = F.silu(self.to_bottleneck(flat)) * self.dynamic_gate_scale
+
+        # read gate - elementwise, static + dynamic
+
+        read_gate = self.to_read_gate(dynamic) + rearrange(self.static_read_logit, 'v s d -> 1 1 (v s d)')
+        read_gate = rearrange(read_gate.sigmoid(), 'b n (v s d) -> v b n s d', v = views, s = streams)
+
+        branch_input = reduce(read_gate * normed, 'v b n s d -> v b n d', 'sum') / streams
+        branch_input = branch_input[0] if views == 1 else branch_input
+
+        # write gate - per stream scalar, static + dynamic
+
+        beta = (self.to_write_gate(dynamic) + self.static_write_logit).sigmoid() * 2
+
+        return branch_input, residuals, dict(beta = beta)
+
+    def forward(self, x, residuals, *, beta, **kwargs):
+        residuals = einsum('b n d, b n s -> b n s d', x, beta) + residuals
+        return rearrange(residuals, 'b n s d -> (b s) n d')
 
 # LIMe - layer integrated memory (dynamic version)
 
@@ -1816,6 +1947,7 @@ class FeedForward(Module):
         sublayer_dropout = 0.,
         no_bias = False,
         zero_init_output = False,
+        output_proj_depth = None,
         softclamp_value = None,
         glu_gate_softclamp_value = None,
     ):
@@ -1861,6 +1993,8 @@ class FeedForward(Module):
 
         if zero_init_output:
             init_zero_(proj_out)
+        elif exists(output_proj_depth):
+            init_depth_scaled_(proj_out, output_proj_depth)
 
     def muon_parameters(self):
         weights = []
@@ -1916,7 +2050,14 @@ class Attention(Module):
         gate_value_heads = False,
         swiglu_values = False,
         gate_values = False,
+        gate_values_rank = None,            # bottleneck dim for low-rank input gate (x); None = bias-less linear
+        gate_values_headwise = False,       # per-head input gate (x); one gate logit per head, broadcasting over the head dimension
+        output_gate = False,                # hybrid gated attention - https://arxiv.org/abs/2608.11805v1
+        output_gate_rank = None,            # bottleneck dim for low-rank output gate (h); None = bias-less linear
+        output_gate_headwise = False,       # per-head output gate (h); one gate logit per head, broadcasting over the head dimension
+        low_rank_silu_gates = True,         # siLU activation in the middle of the low-rank x and h gates, as in HyGA
         zero_init_output = False,
+        output_proj_depth = None,
         hard = False,
         max_attend_past = None,
         qk_norm = False,
@@ -2059,14 +2200,28 @@ class Attention(Module):
         self.laser = laser
         self.laser_softclamp_value = laser_softclamp_value
 
-        # add GLU gating for aggregated values, from alphafold2
+        # hybrid gated attention (HyGA) - https://arxiv.org/abs/2608.11805v1
+        # x gate (input gate) and h gate (output gate) fused additively into the shared gate logits
+        # each gate projects to one logit per head (b n h) when headwise, or per dimension (b n (h d)) otherwise
 
-        self.to_v_gate = None
-        if gate_values:
-            self.to_v_gate = nn.Linear(dim, out_dim)
-            self.to_v_gate_activation = F.silu if swiglu_values else F.sigmoid
-            nn.init.constant_(self.to_v_gate.weight, 0)
-            nn.init.constant_(self.to_v_gate.bias, 10)
+        self.gate_values_headwise = gate_values_headwise
+        self.output_gate_headwise = output_gate_headwise
+
+        assert not (gate_values_headwise and exists(gate_values_rank)), 'gate_values_rank cannot be set when gate_values_headwise is enabled - the headwise gate projects to heads directly'
+        assert not (output_gate_headwise and exists(output_gate_rank)), 'output_gate_rank cannot be set when output_gate_headwise is enabled - the headwise gate projects to heads directly'
+
+        self.to_v_gate_activation = F.silu if swiglu_values else F.sigmoid
+
+        gate_activation = F.silu if low_rank_silu_gates else None
+
+        self.to_v_gate = LoRALinear(dim, heads if gate_values_headwise else out_dim, dim = gate_values_rank, activation = gate_activation) if gate_values else None
+        self.to_output_gate = LoRALinear(out_dim, heads if output_gate_headwise else out_dim, dim = output_gate_rank, activation = gate_activation) if output_gate else None
+
+        self.to_head_space_headwise = Rearrange('b n h -> b h n 1')
+        self.to_head_space_dimwise = Rearrange('b n (h d) -> b h n d', h = heads)
+
+        self.to_v_gate_head_space = self.to_head_space_headwise if gate_values_headwise else self.to_head_space_dimwise
+        self.to_output_gate_head_space = self.to_head_space_headwise if output_gate_headwise else self.to_head_space_dimwise
 
         # add per head gating of the output values, from 'Attend to nothing' paper
 
@@ -2080,16 +2235,20 @@ class Attention(Module):
 
         self.qk_norm = qk_norm
         self.qk_norm_groups = qk_norm_groups
-        self.qk_norm_scale = qk_norm_scale
 
         # whether to use the rmsnorm (equivalent to cosine sim attention when scale is equal to 1) - https://arxiv.org/abs/2302.05442
 
         self.qk_norm_dim_scale = qk_norm_dim_scale
 
         self.qk_norm_q_scale = self.qk_norm_k_scale = 1
+
         if qk_norm and qk_norm_dim_scale:
-            self.qk_norm_q_scale = nn.Parameter(torch.ones(heads, 1, dim_head))
-            self.qk_norm_k_scale = nn.Parameter(torch.ones(kv_heads, 1, dim_head))
+            init_scale = dim_head ** 0.25
+            self.qk_norm_q_scale = nn.Parameter(torch.ones(heads, 1, dim_head) * init_scale)
+            self.qk_norm_k_scale = nn.Parameter(torch.ones(kv_heads, 1, dim_head) * init_scale)
+            qk_norm_scale = self.scale
+
+        self.qk_norm_scale = qk_norm_scale
 
         assert (not qk_norm) or divisible_by(dim_head, qk_norm_groups), 'dimension per attention head must be divisible by the qk norm groups'
         assert not (qk_norm and (dim_head // qk_norm_groups) <= 2), 'the group dimension may be too small (2 was too small in my tests, but 4 still works, surprisingly)'
@@ -2274,6 +2433,8 @@ class Attention(Module):
 
         if zero_init_output:
             init_zero_(self.to_out)
+        elif exists(output_proj_depth):
+            init_depth_scaled_(self.to_out, output_proj_depth)
 
     @torch.no_grad()
     def qk_clip_(
@@ -2434,10 +2595,9 @@ class Attention(Module):
         if self.qk_norm:
             qk_l2norm = partial(l2norm, groups = self.qk_norm_groups)
             q, k = map(qk_l2norm, (q, k))
-            scale = self.qk_norm_scale
 
-            q = q * scale
-            k = k * scale
+            q = q * self.qk_norm_q_scale
+            k = k * self.qk_norm_k_scale
 
         # maybe qk rmsnorm
         # per-head rmsnorm on q/k (k-only variant allowed) - stabilizes attention logits
@@ -2526,7 +2686,7 @@ class Attention(Module):
             mem_k, mem_v = tuple(repeat(t, 'h n d -> b h n d', b = b) for t in (self.mem_k, self.mem_v))
 
             if self.qk_norm:
-                mem_k = l2norm(mem_k)
+                mem_k = qk_l2norm(mem_k)
                 mem_k = mem_k * self.qk_norm_k_scale
 
             k = cat((mem_k, k), dim = -2)
@@ -2726,11 +2886,23 @@ class Attention(Module):
         if exists(o_delta):
             out = out + o_delta
 
-        # alphafold2 styled gating of the values
+        # hybrid gated attention (HyGA) - https://arxiv.org/abs/2608.11805v1
+        # x gate (input gate) and h gate (output gate) fused additively
+        # each gate can be per-head (b n h) or per-dimension (b n (h d)); both are normalized to the
+        # head space, where a per-head gate (b h n 1) broadcasts over the head dimension of the other
 
-        if exists(self.to_v_gate):
-            gates = self.to_v_gate(x)
-            out = out * self.to_v_gate_activation(gates)
+        if exists(self.to_v_gate) or exists(self.to_output_gate):
+            gate_logits = 0.
+
+            if exists(self.to_v_gate):
+                gate_logits = gate_logits + self.to_v_gate_head_space(self.to_v_gate(x))
+
+            if exists(self.to_output_gate):
+                gate_logits = gate_logits + self.to_output_gate_head_space(self.to_output_gate(out))
+
+            out = self.to_head_space_dimwise(out) * self.to_v_gate_activation(gate_logits)
+
+            out = self.merge_heads(out)
 
         # maybe orthogonal projected weighted values - "belief" attention
 
@@ -2778,6 +2950,7 @@ class AttentionLayers(Module):
         causal = False,
         cross_attend = False,
         only_cross = False,
+        only_attn = False, # Ndubuaku et al., https://arxiv.org/abs/2607.18363
         use_scalenorm = False,
         use_rmsnorm = False,
         use_dynamic_tanh = False,
@@ -2821,13 +2994,14 @@ class AttentionLayers(Module):
         pre_norm_has_final_norm = True,
         pre_and_post_norm = False,
         attn_aggregated_residuals = False, # https://www.youtube.com/watch?v=iw1VF8HOCrk
-        attn_residuals_last_output_as_query = False,
         attn_aggregated_residual_kwargs: dict = dict(),
         gate_residual = False,
         orthog_residual = False,
         mv_split_residual = False,
+        gated_multi_residual = False,
         scale_residual = False,
         scale_residual_constant = 1.,
+        depth_scale_residual = False,
         shift_tokens = 0,
         sandwich_norm = False,
         softclamp_output = False,
@@ -2881,7 +3055,7 @@ class AttentionLayers(Module):
         # hyper connections
 
         assert num_residual_streams > 0
-        has_hyper_connections = num_residual_streams > 1
+        has_hyper_connections = num_residual_streams > 1 and not gated_multi_residual
 
         self.num_residual_streams = num_residual_streams
         self.stream_emb = nn.Parameter(torch.zeros(num_residual_streams, dim)) if num_residual_streams > 1 else None
@@ -2904,7 +3078,7 @@ class AttentionLayers(Module):
 
         assert rotary_emb_dim <= dim_head, f'rotary emb dim {rotary_emb_dim} must be less than or equal to attention head dimension {dim_head}'
 
-        if verbose and rotary_emb_dim < 32:
+        if verbose and rotary_pos_emb and rotary_emb_dim < 32:
             logger.warning('when training language model, rotary embedding dimension should be at least 32')
 
         assert at_most_one_of(rotary_pos_emb, polar_pos_emb), f'either rotary positional embedding or polar positional embedding can be turned on'
@@ -2937,7 +3111,7 @@ class AttentionLayers(Module):
             assert alibi_num_heads <= heads, 'number of ALiBi heads must be less than the total number of heads'
             self.rel_pos = AlibiPositionalBias(heads = alibi_num_heads, total_heads = heads, **rel_pos_kwargs)
 
-        assert not (not pre_norm and sandwich_norm), 'sandwich norm cannot be used when not using prenorm'
+        assert not ((not pre_norm or gated_multi_residual) and sandwich_norm), 'sandwich norm cannot be used when not using prenorm'
 
         # pre norm and sandwich norm
         # pre_norm:     norm before each branch (modern default, x = x + branch(norm(x)))
@@ -2955,7 +3129,13 @@ class AttentionLayers(Module):
             self.pre_norm = True
             pre_norm_has_final_norm = False  # post-norm already normalizes output; skip extra final norm
 
-        assert at_most_one_of(gate_residual, attn_aggregated_residuals, orthog_residual, mv_split_residual), 'gate_residual, attn_aggregated_residuals, orthog_residual, and mv_split_residual are mutually exclusive'
+        assert at_most_one_of(has_hyper_connections, gated_multi_residual), 'hyper connections and gated multi residual are mutually exclusive'
+
+        if gated_multi_residual:
+            # the elementwise read gate normalizes, so the block pre-norm is dropped
+            pre_norm = False
+
+        assert at_most_one_of(gate_residual, attn_aggregated_residuals, orthog_residual, mv_split_residual, gated_multi_residual), 'gate_residual, attn_aggregated_residuals, orthog_residual, mv_split_residual, and gated_multi_residual are mutually exclusive'
 
         self.residual_attn = residual_attn
         self.cross_residual_attn = cross_residual_attn
@@ -3015,6 +3195,9 @@ class AttentionLayers(Module):
         if macaron:
             default_block = ('f',) + default_block
 
+        if only_attn:
+            default_block = tuple(filter(not_equals('f'), default_block))
+
         # determine post branch wrapper
 
         assert at_most_one_of(use_layerscale, use_adaptive_layerscale)
@@ -3057,6 +3240,9 @@ class AttentionLayers(Module):
 
         assert not (weight_tie_layers and any([*map(exists, (custom_layers, par_ratio, sandwich_coef))]))
 
+        assert not (only_attn and (exists(layers_execute_order) or unet_skips)), '`only_attn` is not compatible with an explicit `layers_execute_order` or `unet_skips`'
+        assert not (only_attn and exists(custom_layers) and 'f' in custom_layers), '`only_attn` is not compatible with feedforward layers in `custom_layers`'
+
         if weight_tie_layers:
             assert exists(depth), 'depth must be passed in with `weight_tie_layers` = True'
             assert not exists(layers_execute_order)
@@ -3088,6 +3274,11 @@ class AttentionLayers(Module):
             layer_types = default_block * depth
             len_default_block = len(default_block)
 
+        # filter out any feedforward layers from `par_ratio` or `sandwich_coef` (default block already filtered above)
+
+        if only_attn:
+            layer_types = tuple(filter(not_equals('f'), layer_types))
+
         self.has_custom_layer_types = exists(custom_layers) or exists(par_ratio) or exists(sandwich_coef)
         self.len_default_block = len_default_block
 
@@ -3107,6 +3298,26 @@ class AttentionLayers(Module):
 
         depth = default(depth, len(self.layers_execute_order))
         self.depth = depth
+
+        # depth scaling for residuals (Yang et al. / Noci et al.)
+        # boolean `depth_scale_residual` scales the residual branch output projections at init (as in the olmo 'mitchell' init)
+        # while a float value scales the branch output at runtime
+
+        depth_scale_branch_output = isinstance(depth_scale_residual, bool) and depth_scale_residual and not attn_aggregated_residuals
+
+        residual_scale = None
+
+        if attn_aggregated_residuals:
+            residual_scale = 1.
+        elif isinstance(depth_scale_residual, (int, float)) and not isinstance(depth_scale_residual, bool):
+            residual_scale = float(depth_scale_residual)
+        elif isinstance(scale_residual, (int, float)) and not isinstance(scale_residual, bool):
+            residual_scale = float(scale_residual)
+
+        self.depth_scale_residual = depth_scale_branch_output
+        self.residual_scale = residual_scale
+
+        maybe_scale_output = maybe(partial(Scale, residual_scale)) if (exists(residual_scale) and residual_scale != 1.) else identity
 
         # stochastic depth
 
@@ -3128,7 +3339,11 @@ class AttentionLayers(Module):
 
         # whether it has post norm
 
-        self.final_norm = norm_fn() if pre_norm and pre_norm_has_final_norm else Identity()
+        # final norm kept, always for gated multi residual
+
+        keep_final_norm = (pre_norm and pre_norm_has_final_norm) or gated_multi_residual
+
+        self.final_norm = norm_fn() if keep_final_norm else Identity()
 
         # whether unet or not
 
@@ -3206,6 +3421,10 @@ class AttentionLayers(Module):
             block_begin = divisible_by(ind, len_default_block)
             block_ind = ind // len_default_block
 
+            # depth of the current residual branch, for the depth scaled output projection init
+
+            output_proj_depth = (block_ind + 1) if depth_scale_branch_output else None
+
             # attention, cross attention, feedforward
             # each branch draws the next kwargs dict off its own iterator, so a per-layer schedule
             # is consumed in construction order within its layer kind
@@ -3215,14 +3434,14 @@ class AttentionLayers(Module):
             if layer_type == 'a':
                 self_attn_learned_value_residual = learned_value_residual_mix and not is_first_self_attn
 
-                layer = Attention(dim, heads = heads, causal = causal, qkv_receive_diff_residuals = layer_qkv_receives_diff_view, learned_value_residual_mix = self_attn_learned_value_residual, rotate_num_heads = rotate_num_heads, **next(attn_kwargs_iter))
+                layer = Attention(dim, heads = heads, causal = causal, qkv_receive_diff_residuals = layer_qkv_receives_diff_view, learned_value_residual_mix = self_attn_learned_value_residual, rotate_num_heads = rotate_num_heads, output_proj_depth = output_proj_depth, **next(attn_kwargs_iter))
                 is_first_self_attn = False
 
             elif layer_type == 'c':
-                layer = Attention(dim, heads = heads, inverted_attention = next(cross_attn_inverted_attention_iter), **next(cross_attn_kwargs_iter))
+                layer = Attention(dim, heads = heads, inverted_attention = next(cross_attn_inverted_attention_iter), output_proj_depth = output_proj_depth, **next(cross_attn_kwargs_iter))
 
             elif layer_type == 'f':
-                layer = FeedForward(dim, **next(ff_kwargs_iter))
+                layer = FeedForward(dim, output_proj_depth = output_proj_depth, **next(ff_kwargs_iter))
                 layer = layer if not macaron else Scale(0.5, layer)
 
             else:
@@ -3236,6 +3455,8 @@ class AttentionLayers(Module):
             if exists(post_branch_fn):
                 layer = post_branch_fn(layer)
 
+            layer = maybe_scale_output(layer)
+
             layer_integrate = None
 
             if integrate_layers:
@@ -3246,21 +3467,22 @@ class AttentionLayers(Module):
 
             elif attn_aggregated_residuals:
                 layer_integrate_num_view = 3 if layer_qkv_receives_diff_view else 1
-                layer_integrate = AttentionAggregatedResidual(
+                layer_integrate = AttentionResidual(
                     dim,
                     num_views = layer_integrate_num_view,
-                    heads = heads,
-                    dim_head = dim_head,
-                    rotary_pos_emb = rotary_pos_emb,
-                    polar_pos_emb = polar_pos_emb,
-                    last_layer_hiddens_as_query = attn_residuals_last_output_as_query,
-                    attn_kwargs = attn_aggregated_residual_kwargs
+                    **attn_aggregated_residual_kwargs
                 )
 
             # select how the branch output gets combined with the residual stream
             # all share the prepare()/forward() interface; pick the configured variant
 
-            if has_hyper_connections:
+            if gated_multi_residual:
+                residual_fn = partial(GatedMultiResidual, num_residual_streams = num_residual_streams)  # qwen gated residual over multiple streams
+
+                if layer_type == 'a' and hyper_conn_produce_diff_views:
+                    residual_fn = partial(residual_fn, num_input_views = 3)  # separate q/k/v views
+
+            elif has_hyper_connections:
                 residual_fn = partial(HyperConnection, num_residual_streams = num_residual_streams, sinkhorn_iters = hyper_conn_sinkhorn_iters)
 
                 if layer_type == 'a' and hyper_conn_produce_diff_views:
@@ -3379,7 +3601,8 @@ class AttentionLayers(Module):
         cross_attn_kv_residuals: Tensor | None = None,
         flash_pack_seq_kwargs = None,
         flash_pack_seq_context_kwargs = None,
-        causal = None
+        causal = None,
+        transform_block_inputs: dict[int, Callable] | Callable | None = None
     ):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
         assert not (exists(condition) ^ self.need_condition), 'condition needs to be passed in if using adaptive layernorm or vice versa'
@@ -3607,8 +3830,23 @@ class AttentionLayers(Module):
 
         # go through the attention and feedforward layers
 
+        block_hiddens = []
+
         for ind, (layer_type, skip_combine, (norm, block, residual_fn), layer_dropout, layer_integrator) in enumerate(zip(*layer_variables)):
             is_last = ind == (len(self.layers) - 1)
+
+            block_begin = divisible_by(ind, self.len_default_block)
+            block_ind = ind // self.len_default_block
+            block_depth = block_ind + 1
+            block_end = divisible_by(ind + 1, self.len_default_block) or is_last
+
+            # maybe transform block inputs (for depths > 1)
+
+            if block_begin and block_depth > 1 and exists(transform_block_inputs):
+                if isinstance(transform_block_inputs, dict) and block_depth in transform_block_inputs:
+                    x = transform_block_inputs[block_depth](x)
+                elif callable(transform_block_inputs):
+                    x = transform_block_inputs(block_depth, x)
 
             # handle skip connections
 
@@ -3704,6 +3942,9 @@ class AttentionLayers(Module):
             if exists(post_main_norm):
                 x = post_main_norm(x)
 
+            if block_end:
+                block_hiddens.append(x)
+
         if return_hiddens:
             layer_hiddens.append(x)
 
@@ -3725,6 +3966,9 @@ class AttentionLayers(Module):
         if not return_hiddens:
             return x
 
+        if len(block_hiddens) > 0:
+            block_hiddens[-1] = x
+
         if return_gumbel_log_probs:
             for intermeds in intermediates:
                 if (
@@ -3741,6 +3985,7 @@ class AttentionLayers(Module):
             last_hidden = x,
             attn_intermediates = intermediates,
             layer_hiddens = layer_hiddens,
+            block_hiddens = block_hiddens,
             cache_length = next_cache_length + prev_cache_length
         )
 
@@ -3957,6 +4202,7 @@ class TransformerWrapper(Module):
         num_memory_tokens = None,
         memory_tokens_interspersed_every = None,
         tie_embedding = False,
+        tie_embedding_scale: float | None = None,
         logits_dim = None,
         return_only_embed = False,
         num_output_heads = 1,
@@ -4123,7 +4369,8 @@ class TransformerWrapper(Module):
             self.to_logits = None
         elif tie_embedding:
             assert isinstance(token_emb, TokenEmbedding), 'can only tie embedding if using `TokenEmbedding`'
-            self.to_logits = lambda t: t @ self.token_emb.emb.weight.t()
+            self.tie_embedding_scale = default(tie_embedding_scale, dim ** -0.5)
+            self.to_logits = lambda t: (t @ self.token_emb.emb.weight.t()) * self.tie_embedding_scale
         elif num_output_heads > 1:
             self.to_logits = ModuleList([LinearNoBias(dim, logits_dim) for _ in range(num_output_heads)])
         else:
@@ -4206,8 +4453,11 @@ class TransformerWrapper(Module):
         pos = None,
         prepend_embeds = None,
         prepend_mask = None,
+        excise_prepend_embeds = False,
         embed_ids: dict[str, Tensor] = dict(),
         sum_embeds = None,
+        transform_token_embeds = None,
+        transform_block_inputs: dict[int, Callable] | Callable | None = None,
         return_attn_z_loss = False,
         attn_z_loss_weight = 1e-4,
         seq_start_pos = None,
@@ -4244,7 +4494,20 @@ class TransformerWrapper(Module):
 
         external_pos_emb = exists(pos) and pos.dtype != torch.long
         pos_emb = self.pos_emb(x, pos = pos, seq_start_pos = seq_start_pos, offset = seq_pos_offset) if not external_pos_emb else pos
-        x = self.token_emb(x, **token_emb_kwargs) + pos_emb
+
+        # token embeddings, with optional transform callable (e.g. latent fusion in FullBandwidth)
+
+        token_embeds = self.token_emb(x, **token_emb_kwargs)
+
+        if exists(transform_token_embeds):
+            token_embeds = transform_token_embeds(token_embeds)
+        elif exists(transform_block_inputs):
+            if isinstance(transform_block_inputs, dict) and 1 in transform_block_inputs:
+                token_embeds = transform_block_inputs[1](token_embeds)
+            elif callable(transform_block_inputs):
+                token_embeds = transform_block_inputs(1, token_embeds)
+
+        x = token_embeds + pos_emb
 
         # add additional embeddings
 
@@ -4359,7 +4622,7 @@ class TransformerWrapper(Module):
         # the attention layers forward
 
         def _attn_layers_forward(inp, cache = None, **kwargs):
-            return self.attn_layers(inp, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, deep_embeds_and_ids = deep_embed_and_ids, return_hiddens = True, **kwargs)
+            return self.attn_layers(inp, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, deep_embeds_and_ids = deep_embed_and_ids, return_hiddens = True, transform_block_inputs = transform_block_inputs, **kwargs)
 
         # maybe recycling
 
@@ -4594,7 +4857,7 @@ class TransformerWrapper(Module):
         # handle maybe combine mixture
 
         if exists(combine_mixture):
-            with autocast('cuda', enabled = False):
+            with autocast(logits.device.type, enabled = False):
                 prob = logits.softmax(dim = -1)
                 mos = einsum('... k d, ... k -> ... d', prob, combine_mixture)
                 logits = log(mos)
@@ -4606,6 +4869,15 @@ class TransformerWrapper(Module):
 
             if not self.has_multiple_heads:
                 logits = first(logits)
+
+        # maybe excise prepended embeddings
+
+        if exists(prepend_embeds) and excise_prepend_embeds and not exists(cache):
+            prepend_len = prepend_embeds.shape[1]
+            if exists(logits):
+                logits = logits[:, prepend_len:]
+            if exists(x):
+                x = x[:, prepend_len:]
 
         # different returns
 
@@ -4646,7 +4918,7 @@ class TransformerWrapper(Module):
             hiddens = intermediates.hiddens
             new_mems = [cat(pair, dim = -2) for pair in zip(mems, hiddens)] if exists(mems) else hiddens
 
-            new_mems = [t[..., -self.max_mem_len:, :] for t in new_mems]
+            new_mems = [slice_right_at_dim(t, self.max_mem_len, dim = -2) for t in new_mems]
 
             # detaching is now opt-out rather than baked into the slice above, so callers that
             # want to backpropagate across segments can keep the graph attached

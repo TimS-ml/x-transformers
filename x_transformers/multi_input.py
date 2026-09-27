@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn, Tensor
 from torch.nn import Module, ModuleDict
@@ -7,16 +9,19 @@ import torch.nn.functional as F
 
 from typing import Dict
 
-from einops import pack, repeat, unpack
+from einops import pack, rearrange, repeat, unpack
 
 from x_transformers.x_transformers import (
     AttentionLayers,
+    Decoder,
     ScaledSinusoidalEmbedding,
     AbsolutePositionalEmbedding,
     LayerIntermediates,
     LayerNorm,
     always,
+    calc_z_loss,
     pad_at_dim,
+    slice_right_at_dim,
     is_empty,
 )
 
@@ -477,7 +482,8 @@ class MultiInputTransformerWrapper(Module):
             new_mems = [torch.cat(pair, dim = -2) for pair in zip(mems, hiddens)] if exists(mems) else hiddens
 
             # Trim to max memory length and detach from computation graph
-            new_mems = [t[..., -self.max_mem_len:, :].detach() for t in new_mems]
+            # (slice_right_at_dim keeps nothing when max_mem_len = 0, where t[..., -0:, :] kept everything)
+            new_mems = [slice_right_at_dim(t, self.max_mem_len, dim = -2).detach() for t in new_mems]
 
             # Return output with memories if not returning other intermediates
             if not return_intermediates:

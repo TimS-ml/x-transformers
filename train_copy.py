@@ -19,7 +19,7 @@ This task tests the model's ability to:
 import tqdm
 import torch
 import torch.optim as optim
-from x_transformers import XTransformer
+from x_transformers import XTransformer, default_device
 
 # constants
 
@@ -45,8 +45,8 @@ ENC_SEQ_LEN = 32
 # The +1 accounts for the start-of-sequence token
 DEC_SEQ_LEN = 64 + 1
 
-# Use GPU if available, otherwise fall back to CPU
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+# Pick the best available accelerator (xpu > cuda > mps > cpu), see default_device
+DEVICE = default_device()
 
 # helpers
 

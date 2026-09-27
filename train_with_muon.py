@@ -25,7 +25,7 @@ Model: 6-layer transformer with 512 dimensions, 8 attention heads
 # ]
 # ///
 
-from x_transformers import TransformerWrapper, Decoder
+from x_transformers import TransformerWrapper, Decoder, default_device
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 
 import random
@@ -65,6 +65,7 @@ GENERATE_LENGTH = 1024
 
 # Maximum sequence length for training (in characters)
 SEQ_LEN = 1024
+DEVICE = default_device()
 
 # Helper functions for data loading and text decoding
 
@@ -137,8 +138,8 @@ model = TransformerWrapper(
 # This handles the autoregressive decoding and loss computation
 ar_wrapper = AutoregressiveWrapper(model)
 
-# Move model to GPU for faster training
-model.cuda()
+# Move model to the selected device (cuda / xpu / mps / cpu, see default_device)
+model.to(DEVICE)
 
 # Data preparation - loading and splitting enwik8 dataset
 
@@ -191,7 +192,7 @@ class TextSamplerDataset(Dataset):
         """
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        return full_seq.to(DEVICE)
 
     def __len__(self):
         """

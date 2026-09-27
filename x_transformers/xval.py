@@ -30,7 +30,9 @@ from x_transformers.x_transformers import (
     TokenEmbedding,
     ScaledSinusoidalEmbedding,
     AbsolutePositionalEmbedding,
-    always
+    always,
+    pad_at_dim,
+    slice_right_at_dim
 )
 
 from x_transformers.autoregressive_wrapper import (
@@ -174,7 +176,7 @@ class XValTransformerWrapper(nn.Module):
 
         # Output projection to vocabulary
         logits_dim = default(logits_dim, num_tokens)
-        self.to_logits = nn.Linear(dim, logits_dim) if not tie_embedding else lambda t: t @ self.token_emb.emb.weight.t()
+        self.to_logits = nn.Linear(dim, logits_dim) if not tie_embedding else lambda t: (t @ self.token_emb.emb.weight.t()) * (dim ** -0.5)
 
         # Output projection to numerical value (single scalar per position)
         self.to_numerical_output = nn.Sequential(
@@ -306,7 +308,7 @@ class XValTransformerWrapper(nn.Module):
 
         if return_mems:
             hiddens = intermediates.hiddens
-            new_mems = tuple(t[..., -self.max_mem_len:, :].detach() for t in hiddens)
+            new_mems = tuple(slice_right_at_dim(t, self.max_mem_len, dim = -2).detach() for t in hiddens)
             return out, new_mems
 
         if return_attn:

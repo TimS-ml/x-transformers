@@ -66,7 +66,8 @@ from x_transformers.x_transformers import (
     TransformerWrapper,
     ViTransformerWrapper,
     TransformerBlock,
-    layer_schedule   # helper, not a module: returns a depth-length tuple of per-layer hyperparameter values to feed the layer kwargs
+    layer_schedule,  # helper, not a module: returns a depth-length tuple of per-layer hyperparameter values to feed the layer kwargs
+    default_device   # helper, not a module: picks xpu > cuda > mps > cpu (or honors an explicit device); used by the train scripts
 )
 
 # Training wrappers

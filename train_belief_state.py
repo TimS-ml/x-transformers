@@ -11,7 +11,7 @@ information from both past and future context, potentially improving coherence a
 in generated text.
 """
 
-from x_transformers import TransformerWrapper, Decoder, BeliefStateWrapper
+from x_transformers import TransformerWrapper, Decoder, BeliefStateWrapper, default_device
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 
 import random
@@ -53,6 +53,7 @@ SEQ_LEN = 256
 # Whether to use the same model for both forward and backward passes
 # If True, the backward model will be None and forward model handles both directions
 FORWARD_BACKWARD_SAME_MODEL = True
+DEVICE = default_device()
 
 # helpers
 
@@ -143,8 +144,8 @@ model = BeliefStateWrapper(
     backward_decoder = backward_model
 )
 
-# Move model to GPU for faster training
-model.cuda()
+# Move model to the selected device (cuda / xpu / mps / cpu, see default_device)
+model.to(DEVICE)
 
 # prepare enwik8 data
 
@@ -194,8 +195,8 @@ class TextSamplerDataset(Dataset):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
         # Extract the sequence (seq_len + 1 tokens for input and target)
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        # Move to GPU and return
-        return full_seq.cuda()
+        # Move to the selected device and return
+        return full_seq.to(DEVICE)
 
     def __len__(self):
         """

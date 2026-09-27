@@ -19,7 +19,7 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 
-from x_transformers import TransformerWrapper, Decoder
+from x_transformers import TransformerWrapper, Decoder, default_device
 
 # constants
 
@@ -47,6 +47,8 @@ MEET_CRITERIA_THRES_INCREASE_LEN = 10
 
 # Whether to use RNN hybridization to help with state tracking
 HYBRIDIZE_WITH_RNN = True
+
+DEVICE = default_device()
 
 # rnn for fully resolving state tracking by hybridization
 # but will also look into gated delta net + negative eigenvalues (Songlin Yang et al) as a parallel solution
@@ -98,7 +100,7 @@ model = TransformerWrapper(
         # Apply any RNN hybridization settings if configured
         **decoder_kwargs
     )
-).cuda()
+).to(DEVICE)
 
 # optimizer
 
@@ -128,7 +130,7 @@ def cycle(length):
     """
     while True:
         # Generate random binary sequences (0s and 1s)
-        seq = torch.randint(0, 2, (BATCH_SIZE, length)).cuda()
+        seq = torch.randint(0, 2, (BATCH_SIZE, length), device = DEVICE)
         # Compute cumulative sum and take modulo 2 to get parity
         # cumsum counts total 1s seen so far, mod 2 gives even (0) or odd (1)
         labels = (seq.cumsum(dim = -1) % 2)

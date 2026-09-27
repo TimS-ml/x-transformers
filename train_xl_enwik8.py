@@ -57,6 +57,7 @@ def train(
     train_seq_len = 2048,
     e2e_ttt = False,
     ttt_custom_loss = False,
+    ttt_next_latent_loss = False,
     ttt_lr = 1e-3,
     ttt_wd = 0.0,
     tbptt_steps = 2,
@@ -100,7 +101,8 @@ def train(
         ttt_module_paths = ttt_module_paths,
         ttt_lr = ttt_lr,
         ttt_wd = ttt_wd,
-        ttt_custom_loss_module = custom_loss
+        ttt_custom_loss_module = custom_loss,
+        ttt_next_latent_loss = ttt_next_latent_loss
     )
 
     optim = Adam(model.parameters(), lr=learning_rate)

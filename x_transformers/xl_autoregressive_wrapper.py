@@ -35,7 +35,7 @@ from functools import reduce
 from contextlib import nullcontext
 
 import torch
-from torch import nn
+from torch import nn, cat
 from torch.nn import Module
 import torch.nn.functional as F
 from torch.func import functional_call, vmap  # per-sample "fast weight" evaluation, see TTTModuleWrapper
@@ -256,6 +256,41 @@ class EpisodicMemoryWrapper(Module):
 
         return self.net(x, **kwargs)
 
+# low rank linear module
+
+class LowRankLinear(Module):
+    """ replace a module's weight matrix with two low rank matrices, which hold the ttt memories instead of the weight itself """
+
+    def __init__(
+        self,
+        module,
+        low_rank_dim
+    ):
+        super().__init__()
+
+        assert module.weight.ndim == 2, 'low rank only supported for 2 dimensional weight matrices'
+
+        out_dim, in_dim = module.weight.shape
+
+        assert low_rank_dim < min(out_dim, in_dim), f'low rank dim ({low_rank_dim}) must be less than the minimum of the input ({in_dim}) and output ({out_dim}) dimensions of the weight matrix'
+
+        # two low rank matrices, no weight matrix, the memories will be stored in these
+        # the memory is initially zero, but one of the matrices is randomly initialized so the gradients can flow into it
+
+        self.weight_a = nn.Parameter(torch.randn(out_dim, low_rank_dim))
+        self.weight_b = nn.Parameter(torch.zeros(low_rank_dim, in_dim))
+
+        # carry over the bias, if it exists
+
+        self.bias = None
+
+        if exists(module.bias):
+            self.bias = nn.Parameter(module.bias.detach().clone())
+
+    def forward(self, x):
+        weight = self.weight_a @ self.weight_b
+        return F.linear(x, weight, self.bias)
+
 # ttt module wrapper
 
 class TTTModuleWrapper(Module):
@@ -370,6 +405,59 @@ class TTTMetaLearningTargetKLLoss(Module):
         loss = F.kl_div(log_prob_encoded, prob_earlier, reduction = 'none').sum(dim = -1)
         return loss
 
+class TTTNextLatentPredictionLoss(Module):
+    """ use a small MLP to generate the ttt inner loop gradients, by predicting the next latent, instead of cross entropy """
+
+    def __init__(
+        self,
+        *,
+        dim,
+        hidden_dim = None,
+        num_layers = 3,
+        loss_type = 'smooth_l1'
+    ):
+        super().__init__()
+
+        hidden_dim = default(hidden_dim, dim)
+
+        layers = [nn.LayerNorm(dim)]
+
+        for i in range(num_layers):
+            is_last = i == (num_layers - 1)
+
+            in_dim = dim if i == 0 else hidden_dim
+            out_dim = dim if is_last else hidden_dim
+
+            layers.append(nn.Linear(in_dim, out_dim))
+
+            if not is_last:
+                layers.append(nn.GELU())
+
+        self.predictor = nn.Sequential(*layers)
+
+        if loss_type == 'smooth_l1':
+            self.loss_fn = F.smooth_l1_loss
+        elif loss_type == 'mse':
+            self.loss_fn = F.mse_loss
+        else:
+            raise ValueError(f'unknown loss type {loss_type}')
+
+    def forward(self, intermediates, mask = None):
+        hiddens = intermediates.last_layer_hiddens
+
+        # the last token predicts the first token in the window
+
+        pred = self.predictor(hiddens)
+        target = cat((hiddens[:, 1:], hiddens[:, :1]), dim = 1).detach()
+
+        loss = self.loss_fn(pred, target, reduction = 'none').mean(dim = -1) # (b n)
+
+        if exists(mask):
+            # target latent at position i + 1 is only valid if the token label at i + 1 is valid
+            loss = loss.masked_fill(~cat((mask[:, 1:], mask[:, :1]), dim = 1), 0.)
+
+        return loss
+
 # xl autoregressive wrapper class
 
 class XLAutoregressiveWrapper(Module):
@@ -404,7 +492,9 @@ class XLAutoregressiveWrapper(Module):
         ttt_use_muon = False,                           # orthogonalize inner-loop gradients with Newton-Schulz before stepping
         ttt_muon_steps = 5,                             # Newton-Schulz iterations per update
         ttt_muon_lr = 1e-2,                             # separate step size for parameters that Muon actually applied to (matrices only)
+        ttt_low_rank_paths = tuple(),                   # (path, rank) pairs: swap that Linear for a zero-product LowRankLinear and test-time-train only its two factors
         ttt_custom_loss_module: Module | None = None,   # replaces the LM loss as the inner-loop objective; called as (intermediates, mask = ...)
+        ttt_next_latent_loss = False,                   # shortcut for ttt_custom_loss_module = TTTNextLatentPredictionLoss(dim = net.attn_layers.dim)
         episodic_mem_len = 0                            # > 0 adds a learned per-layer kv bank; usable as a dedicated long-term TTT target
     ):
         """
@@ -428,13 +518,22 @@ class XLAutoregressiveWrapper(Module):
         self.max_seq_len = net.max_seq_len
         self.output_is_log_prob = net.output_is_log_prob  # set by mixture-of-softmax; decides cross_entropy vs nll_loss below
 
-        self.ttt_module_paths = ttt_module_paths
+        self.loss_fn = F.cross_entropy if not self.output_is_log_prob else F.nll_loss
+
         self.ttt_lr = ttt_lr
         self.ttt_wd = ttt_wd
         self.ttt_use_muon = ttt_use_muon
         self.ttt_muon_steps = ttt_muon_steps
         self.ttt_muon_lr = ttt_muon_lr
         self.ttt_custom_loss_module = ttt_custom_loss_module
+
+        if ttt_next_latent_loss:
+            assert not exists(ttt_custom_loss_module), 'ttt_custom_loss_module and ttt_next_latent_loss cannot both be set'
+
+            dim = getattr(getattr(net, 'attn_layers', None), 'dim', None)
+            assert exists(dim), 'the model must have an attn_layers.dim attribute to derive the dimension for the next latent prediction loss'
+
+            self.ttt_custom_loss_module = TTTNextLatentPredictionLoss(dim = dim)
 
         self.has_episodic_mem = episodic_mem_len > 0
 
@@ -454,20 +553,37 @@ class XLAutoregressiveWrapper(Module):
 
         self.ttt_paths_map = tuple(cast_tuple(item, 2) for item in ttt_module_paths)
 
-        # modify paths to have 'net.' prepended if wrapped
+        # low rank paths, specifying the path to a weight and the low rank dim, the weight will be replaced with two low rank matrices that hold the ttt memories
+
+        self.ttt_low_rank_paths_map = dict()
+
+        for item in ttt_low_rank_paths:
+            path, low_rank_dim = item
+            self.ttt_low_rank_paths_map[path] = low_rank_dim
+
+        # modify paths to have 'net.' prepended if wrapped, with the exception of the episodic memories which live at the top level of the wrapper
 
         # `net` is now the EpisodicMemoryWrapper, so paths into the real transformer
         # gained a level. 'episodic_mems' is exempt because it hangs off the wrapper
         # itself, not off the inner network
 
         if self.has_episodic_mem:
-            prepended_paths_map = []
-            for src, tgt in self.ttt_paths_map:
-                src = f'net.{src}' if src != 'episodic_mems' else src
-                tgt = f'net.{tgt}' if tgt != 'episodic_mems' else tgt
-                prepended_paths_map.append((src, tgt))
+            self.ttt_paths_map = tuple(
+                (f'net.{src}' if src != 'episodic_mems' else src, f'net.{tgt}' if tgt != 'episodic_mems' else tgt)
+                for src, tgt in self.ttt_paths_map
+            )
 
-            self.ttt_paths_map = tuple(prepended_paths_map)
+            self.ttt_low_rank_paths_map = dict(
+                (f'net.{path}', low_rank_dim)
+                for path, low_rank_dim in self.ttt_low_rank_paths_map.items()
+            )
+
+        # the low rank matrices are both the source and target of the ttt update, as the memories are stored in them
+
+        self.ttt_paths_map = self.ttt_paths_map + tuple(
+            (path, path)
+            for path in self.ttt_low_rank_paths_map.keys()
+        )
 
         # gather all unique wrappers
 
@@ -482,6 +598,13 @@ class XLAutoregressiveWrapper(Module):
                     continue
 
                 mod = get_module_by_path(net, path)
+
+                # maybe replace the weight at this path with two low rank matrices to hold the ttt memories
+
+                if path in self.ttt_low_rank_paths_map:
+                    mod = LowRankLinear(mod, self.ttt_low_rank_paths_map[path])
+                    set_module_by_path(net, path, mod)
+
                 wrapper = TTTModuleWrapper(mod)
                 set_module_by_path(net, path, wrapper)
 
@@ -529,8 +652,8 @@ class XLAutoregressiveWrapper(Module):
         """One inner-loop (test-time training) step, run after a segment.
 
         Mechanically:
-          1. build a scalar loss for the segment (LM cross-entropy / NLL, or the
-             custom loss module if one was given),
+          1. build a per-sample loss (b,) for the segment (LM cross-entropy / NLL,
+             or the custom loss module if one was given),
           2. differentiate it w.r.t. the *source* wrappers' fast weights,
           3. optionally push each gradient through Newton-Schulz (Muon),
           4. apply `p <- p - lr * g - lr * wd * p` to the *target* wrappers' fast
@@ -539,8 +662,9 @@ class XLAutoregressiveWrapper(Module):
         Gradient flow:
           - the differentiation target is `batch_params`, i.e. the per-sample copies
             inside `TTTModuleWrapper`, never the `nn.Parameter`s directly. Since
-            `vmap` keeps each sample on its own slice, one grad call on the
-            batch-aggregated loss still gives correctly separated per-sample grads.
+            `vmap` keeps each sample on its own slice, one grad call on the *sum* of
+            the per-sample losses gives each sample exactly its own gradient, so the
+            write is identical whether a sequence runs alone or in a batch.
           - `create_graph = True` (used in `forward` while training) keeps the inner
             step in the autograd graph, so the updated fast weight is a non-leaf whose
             history reaches back through `dL/dp` to the slow weights. The outer
@@ -561,25 +685,27 @@ class XLAutoregressiveWrapper(Module):
 
         # the custom loss reads `intermediates` (hiddens etc.) rather than the logits,
         # which is how a loss can be defined on top of the decoder rather than on the
-        # next-token target. it may already return a reduced scalar, hence the ndim check
+        # next-token target. it may return (b n), reduced below per sample, or an
+        # already-reduced tensor, hence the ndim check
 
         if exists(self.ttt_custom_loss_module):
             assert exists(intermediates), 'intermediates must be passed to update_ttt when using ttt_custom_loss_module'
             loss_t = self.ttt_custom_loss_module(intermediates, mask = mask)
-            loss_t_per_batch = masked_mean(loss_t, mask) if loss_t.ndim > 1 else loss_t
+            loss_t_per_batch = masked_mean(loss_t, mask, dim = -1) if loss_t.ndim > 1 else loss_t
         else:
-            loss_fn = F.cross_entropy if not self.output_is_log_prob else F.nll_loss
-            loss_t = loss_fn(
+            loss_t = self.loss_fn(
                 rearrange(logits, 'b n c -> b c n'),  # F.cross_entropy wants classes on dim 1
                 chunk_labels,
                 ignore_index = self.ignore_index,
                 reduction = 'none'
             )
 
-            # masked_mean with no `dim` reduces over *everything*, so despite the name
-            # this is a scalar: the mean over all non-ignored tokens in the batch
+            # reduce over the sequence only, giving one loss per sample (b,). e5b145e changed
+            # this from a full reduction: a scalar mean over the whole batch scaled every
+            # sample's fast-weight gradient by its share of the batch's tokens, so the
+            # memory write depended on batch size (see test_ttt_write_batch_size_independent)
 
-            loss_t_per_batch = masked_mean(loss_t, mask)
+            loss_t_per_batch = masked_mean(loss_t, mask, dim = -1)
 
         # gather all batch parameters for source modules
 
@@ -594,8 +720,8 @@ class XLAutoregressiveWrapper(Module):
 
         # compute gradients
 
-        # `.sum()` is a no-op on the already-scalar loss above, but is what makes the
-        # call well-formed if a per-sample loss is ever supplied by a custom module.
+        # `.sum()` over the per-sample losses, not `.mean()`: each sample's fast weights
+        # only see their own term, so a sum hands every sample its unscaled gradient.
         # allow_unused: a source module can be absent from the graph of a custom loss,
         # in which case its gradient comes back as None and is skipped below
 
@@ -833,6 +959,10 @@ class XLAutoregressiveWrapper(Module):
 
             x = out[:, curr_pos:]
 
+            if x.shape[-1] == 0:
+                # the tokens end exactly on a segment boundary, recompute the last complete segment with a fresh cache
+                x = out[:, curr_pos - max_seq_len:]
+
             logits, cache = net(
                 x,
                 mems = curr_mems,
@@ -933,11 +1063,6 @@ class XLAutoregressiveWrapper(Module):
 
         batch, seq_len = x.shape[:2]
 
-        # reset the fast weights to the current slow weights - TTT state does not
-        # persist across calls
-
-        self.init_ttt(batch)
-
         # Split sequences into chunks of max_seq_len
         # This is necessary because Transformer-XL has a maximum segment length
 
@@ -949,8 +1074,6 @@ class XLAutoregressiveWrapper(Module):
         # This ensures chunks contribute to loss proportionally to their size
         loss_weights = tuple((t.shape[-1] / seq_len) for t in split_x)
 
-        loss_fn = F.cross_entropy if not self.output_is_log_prob else F.nll_loss
-
         # Process each chunk and accumulate weighted losses
 
         total_loss = 0.
@@ -961,6 +1084,10 @@ class XLAutoregressiveWrapper(Module):
         forward_context = torch.enable_grad if self.has_ttt else nullcontext
 
         with forward_context():
+            # init the ttt batch parameters under grad context, to work even when called within an outer no_grad context
+            # this also resets the fast weights to the current slow weights - TTT state does not persist across calls
+            self.init_ttt(batch)
+
             for idx, (chunk, chunk_labels, loss_weight) in enumerate(zip(split_x, split_labels, loss_weights)):
                 is_last_chunk = (idx == num_chunks - 1)
                 should_detach = divisible_by(idx + 1, self.tbptt_steps)  # truncated-BPTT boundary: cut both mems and fast weights below
@@ -988,7 +1115,7 @@ class XLAutoregressiveWrapper(Module):
                     if is_last_recurrent_step:
                         mems = intermediates.mems
 
-                    loss = loss_fn(
+                    loss = self.loss_fn(
                         rearrange(logits, 'b n c -> b c n'),
                         chunk_labels,
                         ignore_index = ignore_index,
@@ -997,10 +1124,11 @@ class XLAutoregressiveWrapper(Module):
 
                     mask = chunk_labels != ignore_index
 
-                    # masked_mean without `dim` reduces to a scalar over all non-ignored
-                    # tokens, so the `.mean()` on the next line is a no-op
+                    # one loss per sample (b,), reduced over the sequence only - the TTT
+                    # update needs it unreduced across the batch, and `.mean()` below turns
+                    # it into this chunk's scalar contribution to the outer loss
 
-                    loss_per_batch = masked_mean(loss, mask)
+                    loss_per_batch = masked_mean(loss, mask, dim = -1)
 
                     if is_last_recurrent_step:
                         total_loss = total_loss + loss_per_batch.mean() * loss_weight

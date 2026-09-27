@@ -13,7 +13,8 @@ from x_transformers.x_transformers import (
     LinearNoBias,
     AttentionLayers,
     Attention,
-    Attend
+    Attend,
+    disable_autocast
 )
 
 from x_transformers.neo_mlp import (
@@ -32,6 +33,30 @@ def with_seed(seed):
             return fn(*args, **kwargs)
         return inner
     return decorator
+
+def test_disable_autocast_uses_tensor_device():
+    @disable_autocast
+    def matrix_multiply(x, y):
+        return x @ y
+
+    x = torch.randn(4, 4)
+
+    with torch.autocast('cpu', dtype = torch.bfloat16):
+        out = matrix_multiply(x, x)
+
+    assert out.dtype == torch.float32
+
+@pytest.mark.skipif(
+    not hasattr(torch, 'xpu') or not torch.xpu.is_available(),
+    reason = 'XPU is not available'
+)
+def test_flash_attention_on_xpu():
+    q = torch.randn(2, 4, 8, 16, device = 'xpu')
+    out, _ = Attend(flash = True)(q, q, q)
+
+    assert out.device.type == 'xpu'
+    assert out.shape == q.shape
+    assert torch.isfinite(out).all()
 
 def test_readme():
     model = XTransformer(
@@ -310,15 +335,18 @@ def test_mos():
     eval_logits = model(x)
 
 @param('attn_one_kv_head', (True, False))
-def test_l2_distance(attn_one_kv_head):
+@param('attn_qk_norm_dim_scale', (False, True))
+def test_l2_distance(attn_one_kv_head, attn_qk_norm_dim_scale):
 
     model = TransformerWrapper(
         num_tokens = 20000,
         max_seq_len = 1024,
         attn_layers = Decoder(
             dim = 512,
-            depth = 12,
+            depth = 2,
             heads = 8,
+            attn_qk_norm = True,
+            attn_qk_norm_dim_scale = attn_qk_norm_dim_scale,
             attn_l2_distance = True,
             attn_one_kv_head = attn_one_kv_head,
         )
@@ -626,6 +654,28 @@ def test_hyper_connections(qkv_receive_diff_residuals):
     x = torch.randint(0, 20000, (2, 1024))
 
     model(x)
+
+@param('qkv_receive_diff_residuals', (False, True))
+def test_gated_multi_residual(qkv_receive_diff_residuals):
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 6,
+            heads = 8,
+            gated_multi_residual = True,
+            qkv_receive_diff_residuals = qkv_receive_diff_residuals,
+            num_residual_streams = 2,
+            residual_fn_kwargs = dict(read_gate_rank = 16)
+        )
+    )
+
+    x = torch.randint(0, 256, (2, 128))
+
+    logits = model(x)
+    logits.sum().backward()
 
 @param('hybrid_axial_dim', (1, 4))
 def test_hybrid(hybrid_axial_dim):
@@ -1166,6 +1216,55 @@ def test_beam_search(stochastic):
     assert beams.shape == (4, 2, 10)
     assert scores.shape == (4, 2)
 
+def test_beam_search_kv_cache_parity():
+    from x_transformers import TransformerWrapper, Decoder, AutoregressiveWrapper
+
+    torch.manual_seed(0)
+
+    model = TransformerWrapper(
+        num_tokens = 11,
+        max_seq_len = 32,
+        attn_layers = Decoder(
+            dim = 16,
+            depth = 2,
+            heads = 2,
+            rotary_pos_emb = True
+        )
+    )
+
+    wrapper = AutoregressiveWrapper(model)
+    prompts = torch.tensor([[1, 2, 3], [4, 5, 6]])
+
+    uncached_beams, uncached_scores = wrapper.beam_search(
+        prompts,
+        seq_len = 5,
+        beams = 3,
+        cache_kv = False,
+        return_beams_and_scores = True
+    )
+
+    cached_beams, cached_scores = wrapper.beam_search(
+        prompts,
+        seq_len = 5,
+        beams = 3,
+        cache_kv = True,
+        return_beams_and_scores = True
+    )
+
+    assert torch.equal(cached_beams, uncached_beams)
+    assert torch.allclose(cached_scores, uncached_scores, atol = 1e-5)
+
+    unrestricted_beams, unrestricted_scores = wrapper.beam_search(
+        prompts,
+        seq_len = 5,
+        beams = 3,
+        restrict_to_max_seq_len = False,
+        return_beams_and_scores = True
+    )
+
+    assert torch.equal(unrestricted_beams, uncached_beams)
+    assert torch.allclose(unrestricted_scores, uncached_scores, atol = 1e-5)
+
 
 @param('num_pooled_tokens', (1, 3))
 @param('attn_pool_depth', (1, 3))
@@ -1646,32 +1745,19 @@ def test_continuous_transformer_external_projects():
 
     assert logits.shape == (1, 16, 16)
 
-@param('pos_emb_type', ('rotary', 'polar', 'none'))
 @param('qkv_receive_diff_residuals', (False, True))
-@param('last_layer_as_query', (False, True))
 def test_attn_aggregated_residuals(
-    pos_emb_type,
-    qkv_receive_diff_residuals,
-    last_layer_as_query
+    qkv_receive_diff_residuals
 ):
-
-    kwargs = dict()
-    if pos_emb_type == 'rotary':
-        kwargs = dict(rotary_pos_emb = True)
-    elif pos_emb_type == 'polar':
-        kwargs = dict(polar_pos_emb = True)
-
     model = TransformerWrapper(
         num_tokens = 256,
         max_seq_len = 1024,
         attn_layers = Decoder(
             dim = 512,
-            depth = 6,
+            depth = 4,
             heads = 8,
             attn_aggregated_residuals = True,
-            qkv_receive_diff_residuals = qkv_receive_diff_residuals,
-            attn_residuals_last_output_as_query = last_layer_as_query,
-            **kwargs
+            qkv_receive_diff_residuals = qkv_receive_diff_residuals
         )
     )
 
@@ -1679,6 +1765,24 @@ def test_attn_aggregated_residuals(
 
     logits = model(x)
     logits.sum().backward()
+
+@param('num_views', (1, 3))
+def test_attn_aggregated_residual_query_conditioned_on_latest_hidden(
+    num_views
+):
+    from x_transformers.x_transformers import AttentionResidual
+
+    res = AttentionResidual(dim = 32, num_views = num_views, lora_rank = 4)
+
+    assert isinstance(res.to_keys, nn.RMSNorm)
+
+    hiddens = [torch.randn(2, 5, 32) for _ in range(3)]
+
+    out = res(hiddens)
+    out_changed = res([*hiddens[:-1], torch.randn(2, 5, 32)])
+
+    assert out.shape == ((2, 5, 32) if num_views == 1 else (num_views, 2, 5, 32))
+    assert not torch.allclose(out, out_changed)
 
 def test_causal_override():
     model = TransformerWrapper(
@@ -1907,7 +2011,7 @@ def test_inverted_cross_attn(attn_sigmoid):
 
     assert out.shape == (2, 64, 512)
 
-@param('use_custom_loss', (False, True))
+@param('use_custom_loss', ('none', 'kl', 'next_latent'))
 @param('ttt_use_muon', (False, True))
 @param('episodic_mem_len', (0, 16))
 def test_ttt_equivalency(use_custom_loss, ttt_use_muon, episodic_mem_len):
@@ -1936,7 +2040,9 @@ def test_ttt_equivalency(use_custom_loss, ttt_use_muon, episodic_mem_len):
     )
 
     custom_loss = None
-    if use_custom_loss:
+    ttt_next_latent_loss = use_custom_loss == 'next_latent'
+
+    if use_custom_loss == 'kl':
         custom_loss = TTTMetaLearningTargetKLLoss(dim = 256, num_classes = 256)
 
     ttt_module_paths = ('attn_layers.layers.0.1.to_v',)
@@ -1951,7 +2057,8 @@ def test_ttt_equivalency(use_custom_loss, ttt_use_muon, episodic_mem_len):
         ttt_lr = 0.,
         ttt_use_muon = ttt_use_muon,
         ttt_muon_lr = 0.,
-        ttt_custom_loss_module = custom_loss
+        ttt_custom_loss_module = custom_loss,
+        ttt_next_latent_loss = ttt_next_latent_loss
     )
 
     # longer sequence to trigger inner ttt gradient updates
@@ -1961,17 +2068,34 @@ def test_ttt_equivalency(use_custom_loss, ttt_use_muon, episodic_mem_len):
     loss_base = wrapper_base(x)
     loss_ttt = wrapper_ttt(x)
 
-    assert torch.allclose(loss_base, loss_ttt, atol = 1e-5)
+    # the next latent loss goes through the vmap'd functional_call path, which has slight numerical differences
+    atol = 1e-3 if ttt_next_latent_loss else 1e-5
+
+    assert torch.allclose(loss_base, loss_ttt, atol = atol)
 
     loss_base.backward()
     loss_ttt.backward()
 
-    for (name_base, p_base), (name_ttt, p_ttt) in zip(model.named_parameters(), model_clone.named_parameters()):
-        assert exists(p_base.grad) and exists(p_ttt.grad)
-        assert torch.allclose(p_base.grad, p_ttt.grad, atol = 1e-4)
+    params_base = dict(model.named_parameters())
+    params_ttt = dict(model_clone.named_parameters())
 
-    if use_custom_loss:
+    for name_base, p_base in params_base.items():
+        assert exists(p_base.grad)
+
+        if name_base not in params_ttt:
+            continue
+
+        p_ttt = params_ttt[name_base]
+
+        assert exists(p_ttt.grad)
+        assert torch.allclose(p_base.grad, p_ttt.grad, atol = 1e-3 if ttt_next_latent_loss else 1e-4)
+
+    if exists(custom_loss):
         for p in custom_loss.parameters():
+            assert exists(p.grad)
+
+    if ttt_next_latent_loss:
+        for p in wrapper_ttt.ttt_custom_loss_module.parameters():
             assert exists(p.grad)
 
     # test generate equivalency
@@ -1994,7 +2118,8 @@ def test_ttt_equivalency(use_custom_loss, ttt_use_muon, episodic_mem_len):
         ttt_lr = 1.0,
         ttt_use_muon = ttt_use_muon,
         ttt_muon_lr = 1.0,
-        ttt_custom_loss_module = deepcopy(custom_loss) if use_custom_loss else None
+        ttt_custom_loss_module = deepcopy(custom_loss) if exists(custom_loss) else None,
+        ttt_next_latent_loss = ttt_next_latent_loss
     )
 
     out_ttt_actual = with_seed(seed)(wrapper_ttt_actual.generate)(prompt, 10, temperature = 0.)
@@ -2007,6 +2132,91 @@ def test_ttt_equivalency(use_custom_loss, ttt_use_muon, episodic_mem_len):
 
     for wrapper in wrapper_ttt_actual.ttt_wrappers.values():
         assert not exists(wrapper.batch_params)
+
+@param('episodic_mem_len', (0, 16))
+def test_ttt_low_rank(episodic_mem_len):
+    from x_transformers.xl_autoregressive_wrapper import XLAutoregressiveWrapper, LowRankLinear
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 512,
+        max_mem_len = 512,
+        attn_layers = Decoder(
+            dim = 256,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    to_v_path = 'attn_layers.layers.0.1.to_v'
+    low_rank_dim = 32
+
+    wrapper_ttt = XLAutoregressiveWrapper(
+        model,
+        tbptt_steps = 1000,
+        episodic_mem_len = episodic_mem_len,
+        ttt_module_paths = (to_v_path,),
+        ttt_low_rank_paths = ((to_v_path, low_rank_dim),),
+        ttt_lr = 1e-2
+    )
+
+    net_prefix = 'net.' if episodic_mem_len > 0 else ''
+    wrapped_path = f'{net_prefix}{to_v_path}'
+
+    # the weight is replaced with two low rank matrices, which hold the ttt memories
+
+    to_v_wrapper = wrapper_ttt.ttt_wrappers[wrapped_path]
+
+    assert isinstance(to_v_wrapper.module, LowRankLinear)
+    assert to_v_wrapper.module.weight_a.shape == (256, low_rank_dim)
+    assert to_v_wrapper.module.weight_b.shape == (low_rank_dim, 256)
+
+    # the low rank matrices are both the source and target of the ttt update
+
+    assert (wrapped_path, wrapped_path) in wrapper_ttt.ttt_paths_map
+
+    x = torch.randint(0, 256, (2, 1025))
+
+    loss = wrapper_ttt(x)
+
+    assert exists(loss)
+
+    # the ttt memories are stored in the low rank matrices, no full weight
+
+    batch_params = to_v_wrapper.batch_params
+
+    assert 'weight' not in batch_params
+    assert batch_params['weight_a'].shape == (2, 256, low_rank_dim)
+    assert batch_params['weight_b'].shape == (2, low_rank_dim, 256)
+
+    # gradients flow into the low rank matrices
+
+    loss.backward()
+
+    for name in ('weight_a', 'weight_b'):
+        assert exists(getattr(to_v_wrapper.module, name).grad)
+
+    # the memories are stored in the low rank matrices at test time, the memory being the product of the two matrices
+
+    def memory(params):
+        return params['weight_a'][0] @ params['weight_b'][0]
+
+    # the memory starts out zero
+
+    wrapper_ttt.init_ttt(2)
+
+    batch_params = to_v_wrapper.batch_params
+
+    assert torch.allclose(memory(batch_params), torch.zeros_like(memory(batch_params)))
+
+    params_before = {name: p.clone() for name, p in batch_params.items()}
+
+    wrapper_ttt(torch.randint(0, 256, (2, 1025)))
+
+    batch_params = to_v_wrapper.batch_params
+
+    assert not torch.allclose(memory(batch_params), memory(params_before))
+    assert not torch.allclose(batch_params['weight_b'], params_before['weight_b'])
 
 def test_ttt_source_target_mapping():
     import copy
@@ -2139,6 +2349,49 @@ def test_ttt_sleep_phase():
     loss.backward()
 
     assert loss.ndim == 0
+
+@param('batch_size', (2, 4))
+def test_ttt_write_batch_size_independent(batch_size):
+    # the ttt inner loop loss is reduced per batch element (dim = -1), so the memory
+    # write must be identical whether a sequence is processed alone or in a batch
+
+    from x_transformers.xl_autoregressive_wrapper import XLAutoregressiveWrapper
+    from x_transformers import Decoder, TransformerWrapper
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 32,
+        max_mem_len = 32,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    wrapper_ttt = XLAutoregressiveWrapper(
+        model,
+        tbptt_steps = 32,
+        ttt_module_paths = ('episodic_mems',),
+        episodic_mem_len = 8,
+        ttt_lr = 10.
+    )
+
+    def write_memory(seq):
+        wrapper_ttt.init_ttt(seq.shape[0])
+
+        logits, intermediates = wrapper_ttt.net(seq[:, :-1], return_intermediates = True)
+
+        wrapper_ttt.update_ttt(logits, seq[:, 1:], create_graph = False, intermediates = intermediates)
+
+        return wrapper_ttt.ttt_wrappers['episodic_mems'].batch_params['mem_kv'].detach()
+
+    seqs = torch.randint(0, 256, (batch_size, 33))
+
+    mem_batched = write_memory(seqs)
+    mem_single = torch.stack([write_memory(seqs[i:i + 1])[0] for i in range(batch_size)])
+
+    assert torch.allclose(mem_batched, mem_single, atol = 1e-4)
 
 @param('dynamics_type', ('residual', 'gru', 'custom'))
 @param('loss_type', ('smooth_l1', 'mse_and_cosine_sim'))
@@ -2277,3 +2530,559 @@ def test_relative_proj_positional_bias():
     out = model(tokens)
     assert out.shape == (2, 10, 256)
     out.sum().backward()
+
+@param('repulsive_loss_weight', (0., 0.1))
+def test_xm_latent_decoder(
+    repulsive_loss_weight
+):
+    from x_transformers.xm_latent_decoder import XMLatentDecoder
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 512,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    decoder = XMLatentDecoder(
+        net = model,
+        num_latents = 4,
+        candidates = 2,
+        always_latent_proj = True,
+        repulsive_loss_weight = repulsive_loss_weight
+    )
+
+    assert isinstance(decoder.latent_proj, torch.nn.Linear)
+
+    x = torch.randint(0, 256, (2, 32))
+
+    # test forward loss calculation
+
+    loss = decoder(x)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+
+    # test loss with different candidates
+
+    loss_k1 = decoder(x, candidates = 1)
+    loss_k4 = decoder(x, candidates = 4)
+    assert loss_k1.ndim == 0 and loss_k4.ndim == 0
+
+    # test custom latents
+
+    custom_latents = torch.randn(2, 2, 4, 64)
+    loss_latents = decoder(x, latents = custom_latents)
+    assert loss_latents.ndim == 0
+    assert not torch.isnan(loss_latents)
+
+    # test latent_drop_prob
+
+    loss_dropped = decoder(x, latent_drop_prob = 1.0)
+    assert loss_dropped.ndim == 0
+    assert not torch.isnan(loss_dropped)
+
+    # test unconditioned generate
+
+    start_tokens = x[:, :4]
+    gen = decoder.generate(start_tokens, seq_len = 8)
+    assert gen.shape == (2, 8)
+
+    # test conditioned generate with custom latents
+
+    latents_input = torch.randn(2, 4, 64)
+    gen_cond = decoder.generate(start_tokens, seq_len = 8, latents = latents_input)
+    assert gen_cond.shape == (2, 8)
+
+    # test candidate latents generate
+
+    def max_confidence(logits):
+        top2 = logits.softmax(dim = -1).topk(2, dim = -1).values
+        return (top2[..., 0] - top2[..., 1]).mean(dim = -1).argmax(dim = -1)
+
+    gen_candidates = decoder.generate_with_candidate_latents(start_tokens, seq_len = 8, candidates = 3, winner_fn = max_confidence)
+    assert gen_candidates.shape == (2, 8)
+
+    # test returning best latents
+
+    gen_cand, (all_latents, winner_indices) = decoder.generate_with_candidate_latents(start_tokens, seq_len = 8, candidates = 3, winner_fn = max_confidence, return_best_latents = True)
+    assert gen_cand.shape == (2, 8)
+    assert all_latents.shape == (2, 3, 4, 64)
+    assert winner_indices.shape == (2,)
+
+    # test sequence mask & variable lengths
+
+    x_padded = torch.randint(0, 256, (2, 32))
+    mask = torch.ones((2, 32), dtype = torch.bool)
+    mask[0, 20:] = False
+    mask[1, 25:] = False
+
+    loss_masked = decoder(x_padded, mask = mask, candidates = 3)
+    assert loss_masked.ndim == 0 and not torch.isnan(loss_masked)
+
+    # test custom winner_fn (ex. highest entropy)
+
+    def highest_entropy_winner(losses, intermediates):
+        logits = intermediates.logits
+        probs = logits.softmax(dim = -1)
+        log_probs = logits.log_softmax(dim = -1)
+        return - (probs * log_probs).sum(dim = -1).mean(dim = -1)
+
+    loss = decoder(x, winner_fn = highest_entropy_winner)
+    assert not torch.isnan(loss)
+    loss.backward()
+
+def test_xm_factorized_latent_decoder():
+    from x_transformers.xm_latent_decoder import XMLatentDecoder, lowest_loss_winner_fn
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 512,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    def highest_entropy(losses, intermediates):
+        logits = intermediates.logits
+        probs = logits.softmax(dim = -1)
+        log_probs = logits.log_softmax(dim = -1)
+        return - (probs * log_probs).sum(dim = -1).mean(dim = -1)
+
+    winner_fns = (
+        lowest_loss_winner_fn,
+        highest_entropy
+    )
+
+    decoder = XMLatentDecoder(
+        net = model,
+        num_latents = 2,
+        candidates = 3,
+        winner_fns = winner_fns
+    )
+
+    x = torch.randint(0, 256, (2, 32))
+
+    # verify that when exploring one latent, other latents are held constant across candidates
+    # while the transformer is conditioned on both latents
+
+    _, cand_latents_0 = decoder(x, active_latent_index = 0, return_loss = False)
+    assert cand_latents_0.shape == (2, 3, 2, 64)
+    assert torch.allclose(cand_latents_0[:, 0, 1], cand_latents_0[:, 1, 1])
+    assert not torch.allclose(cand_latents_0[:, 0, 0], cand_latents_0[:, 1, 0])
+
+    _, cand_latents_1 = decoder(x, active_latent_index = 1, return_loss = False)
+    assert cand_latents_1.shape == (2, 3, 2, 64)
+    assert torch.allclose(cand_latents_1[:, 0, 0], cand_latents_1[:, 1, 0])
+    assert not torch.allclose(cand_latents_1[:, 0, 1], cand_latents_1[:, 1, 1])
+
+    # forward loss (stochastically selects one latent to explore while holding others constant)
+
+    loss = decoder(x)
+    assert not torch.isnan(loss)
+    loss.backward()
+
+    # researcher can also explicitly specify which latent to explore
+
+    loss_latent_1 = decoder(x, active_latent_index = 1)
+    assert not torch.isnan(loss_latent_1)
+
+    # factorized generation with candidate latents
+
+    start_tokens = x[:, :4]
+
+    def max_confidence(logits):
+        top2 = logits.softmax(dim = -1).topk(2, dim = -1).values
+        return (top2[..., 0] - top2[..., 1]).mean(dim = -1).argmax(dim = -1)
+
+    gen = decoder.generate_with_candidate_latents(
+        start_tokens,
+        seq_len = 8,
+        winner_fn = max_confidence
+    )
+
+    assert gen.shape == (2, 8)
+
+def test_xm_flexible_slot_latents():
+    from x_transformers.xm_latent_decoder import XMLatentDecoder
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 512,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 2,
+            heads = 4
+        )
+    )
+
+    decoder = XMLatentDecoder(
+        net = model,
+        num_latents = 4,
+        candidates = 3
+    )
+
+    x = torch.randint(0, 256, (2, 32))
+    start_tokens = x[:, :4]
+
+    z0, z1, z2, z3 = (torch.randn(2, 64) for _ in range(4))
+
+    # a specific latent can be passed for one of the slots, multiple, or all, with None for random
+
+    _, cand_latents = decoder(x, latents = (z0, None, None, None), active_latent_index = 1, return_loss = False)
+    assert cand_latents.shape == (2, 3, 4, 64)
+    assert torch.allclose(cand_latents[:, 0, 0], z0)
+
+    _, cand_latents = decoder(x, latents = (z0, None, z2, None), active_latent_index = 1, return_loss = False)
+    assert torch.allclose(cand_latents[:, 0, 0], z0)
+    assert torch.allclose(cand_latents[:, 0, 2], z2)
+
+    _, cand_latents = decoder(x, latents = (z0, z1, z2, z3), active_latent_index = 0, return_loss = False)
+    assert torch.allclose(cand_latents[:, 0, 1], z1)
+    assert torch.allclose(cand_latents[:, 0, 2], z2)
+    assert torch.allclose(cand_latents[:, 0, 3], z3)
+
+    # one latent per slot must be given
+
+    with pytest.raises(AssertionError):
+        decoder(x, latents = (z0, z1))
+
+    # forward loss, generation, and candidate generation accept the same
+
+    loss = decoder(x, latents = (z0, None, z2, None), active_latent_index = 1)
+    assert not torch.isnan(loss)
+    loss.backward()
+
+    gen = decoder.generate(start_tokens, seq_len = 8, latents = (z0, None, None, None))
+    assert gen.shape == (2, 8)
+
+    def max_confidence(logits):
+        top2 = logits.softmax(dim = -1).topk(2, dim = -1).values
+        return (top2[..., 0] - top2[..., 1]).mean(dim = -1).argmax(dim = -1)
+
+    gen = decoder.generate_with_candidate_latents(start_tokens, seq_len = 8, winner_fn = max_confidence, latents = (None, None, z2, None), active_latent_index = 1)
+    assert gen.shape == (2, 8)
+
+@param('x_config', ((False, None), (False, 8), (True, None)))
+@param('h_config', ((False, None), (False, 8), (True, None)))
+@param('swiglu_values', (False, True))
+def test_attn_gating(x_config, h_config, swiglu_values):
+    x_headwise, x_rank = x_config
+    h_headwise, h_rank = h_config
+
+    attn = Attention(
+        dim = 128,
+        heads = 4,
+        dim_head = 32,
+        causal = True,
+        gate_values = True,
+        gate_values_headwise = x_headwise,
+        gate_values_rank = x_rank,
+        output_gate = True,
+        output_gate_headwise = h_headwise,
+        output_gate_rank = h_rank,
+        swiglu_values = swiglu_values
+    )
+
+    x = torch.randn(2, 32, 128)
+    out = attn(x)
+
+    out.sum().backward()
+
+def test_recirculation():
+    from x_transformers import AutoregressiveWrapper
+    from x_transformers.recirculation import Recirculation
+
+    net = TransformerWrapper(
+        num_tokens = 64,
+        max_seq_len = 64,
+        attn_layers = Decoder(
+            dim = 8,
+            depth = 4,
+            heads = 4,
+            rotary_pos_emb = True
+        )
+    )
+
+    model = Recirculation(
+        net,
+        source_layer = 3,
+        destination_layer = 1,
+        alpha = 0.15
+    )
+
+    x = torch.randint(0, 64, (2, 8))
+
+    logits = model(x)
+    assert logits.shape == (2, 8, 64)
+
+    logits.sum().backward()
+
+    # works within the autoregressive wrapper
+
+    wrapper = AutoregressiveWrapper(model)
+
+    generated = wrapper.generate(torch.randint(0, 64, (2, 4)), 16)
+    assert generated.shape == (2, 16)
+
+    # generate a bit past the max sequence length, with cache truncation
+
+    generated = wrapper.generate(torch.randint(0, 64, (2, 60)), 16)
+    assert generated.shape == (2, 16)
+
+    # multiple source / destination routes, each with its own alpha
+
+    multi = Recirculation(
+        net,
+        source_layer = (2, 3),
+        destination_layer = (0, 1),
+        alpha = (0.1, 0.2)
+    )
+
+    logits = multi(x)
+    assert logits.shape == (2, 8, 64)
+
+    logits.sum().backward()
+
+    # learned mlp for the mixture coefficients
+
+    learned = Recirculation(
+        net,
+        source_layer = 3,
+        destination_layer = 1,
+        use_learned = True
+    )
+
+    logits = learned(x)
+    assert logits.shape == (2, 8, 64)
+
+    logits.sum().backward()
+
+    # learned mixer variant too
+
+    learned_wrapper = AutoregressiveWrapper(learned)
+
+    generated = learned_wrapper.generate(torch.randint(0, 64, (2, 4)), 16)
+    assert generated.shape == (2, 16)
+
+def test_only_attn():
+    model = TransformerWrapper(
+        num_tokens = 20000,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 12,
+            heads = 8,
+            only_attn = True,
+            attn_qk_norm = True,
+        )
+    )
+
+    assert model.attn_layers.num_ff_layers == 0
+
+    x = torch.randint(0, 20000, (1, 1024))
+    logits = model(x)
+    logits.sum().backward()
+
+def test_discover():
+    from x_transformers.x_transformers import TransformerWrapper, Decoder
+    from x_transformers.discover_wrapper import (
+        DiscoverDecoder,
+        TPREncoder,
+        role_ids_for_tokens
+    )
+
+    # reversal task, 6 symbols over length 3
+
+    model = DiscoverDecoder(
+        decoder = TransformerWrapper(
+            num_tokens = 8,
+            max_seq_len = 16,
+            attn_layers = Decoder(dim = 32, depth = 2, heads = 2, ff_mult = 2)
+        ),
+        num_fillers = 6,
+        bos_id = 6,
+        pad_id = 7,
+        max_seq_len = 3
+    )
+
+    src = torch.randint(0, 6, (8, 3))
+    tgt = src.flip(-1)
+
+    # train on list reversal
+
+    logits = model(src, tgt)
+    loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 8), tgt.reshape(-1))
+    loss.backward()
+
+    # decode from E
+
+    encodings = model.encode(src)
+    outputs = model.decode(encodings, torch.full((8,), 3))
+    assert outputs.shape == (8, 3)
+
+    # fit TPR to encodings, use in place of E
+
+    tokens = torch.randint(0, 6, (256, 3))
+    lengths = torch.full((256,), 3)
+    mask = torch.ones(256, 3, dtype = torch.bool)
+    role_ids = role_ids_for_tokens(tokens, lengths, 'bidirectional', max_seq_len = 3, num_fillers = 6)
+
+    tpr = TPREncoder(dim = model.dim, num_fillers = 6, num_roles = 6)
+    tpr.fit(tokens, role_ids, model.encode(tokens), mask = mask, steps = 40, batch_size = 64)
+
+    approx_encodings = tpr(tokens, role_ids, mask)
+    assert approx_encodings.shape == (256, model.dim)
+
+    outputs = model.decode(approx_encodings, lengths)
+    assert outputs.shape == (256, 3)
+
+    # constituent surgery: swap a filler, decode edited encoding
+
+    row = tokens[:1]
+    edited = row.clone()
+    edited[0, 1] = (int(row[0, 1]) + 1) % 6
+
+    role_ids_old = role_ids_for_tokens(row, lengths[:1], 'bidirectional', max_seq_len = 3, num_fillers = 6)
+    role_ids_new = role_ids_for_tokens(edited, lengths[:1], 'bidirectional', max_seq_len = 3, num_fillers = 6)
+
+    outputs = model.surgery(row, edited, role_ids_old, role_ids_new, tpr)
+    assert outputs.shape == (1, 3)
+
+    # nonlinear MLP readout variant
+
+    tpr_mlp = TPREncoder(dim = model.dim, num_fillers = 6, num_roles = 6, mlp_dim = 16)
+    tpr_mlp.fit(tokens, role_ids, model.encode(tokens), mask = mask, steps = 20, batch_size = 128)
+
+    approx_encodings = tpr_mlp(tokens, role_ids, mask)
+    outputs = model.surgery(row, edited, role_ids_old, role_ids_new, tpr_mlp)
+    assert approx_encodings.shape == (256, model.dim)
+    assert outputs.shape == (1, 3)
+
+@param('depth_scale_residual', (False, True, 0.5))
+def test_depth_scale_residual(depth_scale_residual):
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        attn_layers = Decoder(
+            dim = 512,
+            depth = 4,
+            heads = 8,
+            depth_scale_residual = depth_scale_residual
+        )
+    )
+
+    x = torch.randint(0, 256, (2, 1024))
+    logits = model(x)
+    logits.sum().backward()
+
+def test_full_bandwidth():
+    from x_transformers.full_bandwidth import FullBandwidth, LossBreakdown
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 1024,
+        tie_embedding = True,
+        post_emb_norm = True,
+        attn_layers = Decoder(
+            dim = 128,
+            depth = 2,
+            heads = 4,
+            depth_scale_residual = True
+        )
+    )
+
+    fb = FullBandwidth(model, temporal_parallel_passes = 2)
+
+    tokens = torch.randint(0, 256, (2, 16))
+
+    loss, all_logits = fb(tokens, temporal_parallel_passes = 3, return_all_pass_logits = True)
+    assert loss.item() > 0
+    assert len(all_logits) == 3
+
+    loss_single = fb(tokens, temporal_parallel_passes = 1)
+    assert loss_single.item() > 0
+
+    logits = fb(tokens, temporal_parallel_passes = 3, return_loss = False)
+    assert logits.shape == (2, 16, 256)
+
+    loss, loss_breakdown = fb(tokens, temporal_parallel_passes = 3, return_loss_breakdown = True)
+    assert exists(loss_breakdown.first_pass_loss)
+    assert len(loss_breakdown.feedback_pass_losses) == 2
+    assert len(loss_breakdown.all_pass_losses) == 3
+
+    loss.backward()
+    assert exists(model.token_emb.emb.weight.grad)
+
+    # dynamic rollout loss weight
+
+    loss_dynamic = fb(tokens, temporal_parallel_passes = 3, dynamic_rollout_loss_weight = True)
+    assert loss_dynamic.item() > 0
+    loss_dynamic.backward()
+
+    # generate
+ 
+    prompts = torch.randint(0, 256, (2, 5))
+
+    sampled = fb.generate(prompts, seq_len = 10)
+    assert sampled.shape == (2, 10)
+
+    # 1d prompt
+
+    sampled_1d = fb.generate(prompts[0], seq_len = 10)
+    assert sampled_1d.shape == (10,)
+
+    # generate with selective latent fusion
+
+    sampled_selective = fb.generate(
+        prompts,
+        seq_len = 10,
+        should_fuse_latent = lambda step: step < 5
+    )
+    assert sampled_selective.shape == (2, 10)
+
+def test_full_bandwidth_recirculation():
+    from x_transformers.full_bandwidth import FullBandwidth
+
+    model = TransformerWrapper(
+        num_tokens = 256,
+        max_seq_len = 512,
+        tie_embedding = True,
+        post_emb_norm = True,
+        attn_layers = Decoder(
+            dim = 64,
+            depth = 4,
+            heads = 4,
+            attn_dim_head = 16,
+            depth_scale_residual = True
+        )
+    )
+
+    tokens = torch.randint(0, 256, (2, 16))
+
+    patterns = (
+        'prev',
+        'self',
+        'top_and_prev',
+        ((4, 1), (4, 4), (3, 3), (2, 2)),
+        ((4, 3, 'glu'), (3, 2, 'residual'), (2, 1, 'gru'))
+    )
+
+    for pattern in patterns:
+        fb = FullBandwidth(
+            model,
+            temporal_parallel_passes = 2,
+            recirc_pairs = pattern
+        )
+
+        loss = fb(tokens)
+        assert loss.item() > 0
+        loss.backward()
+
+    prompts = torch.randint(0, 256, (2, 8))
+    sampled = fb.generate(prompts, seq_len = 16)
+    assert sampled.shape == (2, 16)

@@ -59,6 +59,16 @@ def default(val, d):
 def l2norm(t, dim = -1):
     return F.normalize(t, p = 2, dim = dim)
 
+# dynamic rollout loss weighting
+# weight each rollout step by exp(-decay * cumulative loss of preceding steps), as errors compound through the dynamics model
+
+def dynamic_rollout_loss_weights(
+    step_losses, # (r b n)
+    decay = 1.
+):
+    cum_step_losses = exclusive_cumsum(step_losses, dim = 0)
+    return (-decay * cum_step_losses).exp()
+
 # constants
 
 # breakdown returned by `forward(..., return_loss_breakdown = True)`
@@ -306,8 +316,7 @@ class NextLatentWrapper(Module):
             num_knots = 17
         ),
         dynamic_rollout_loss_weight = True,     # additionally scale step r by how well steps < r are already doing (per token, recomputed every batch)
-        dynamic_loss_decay = 1.0,               # sigmoid slope of that dynamic weight; larger cuts off deep steps more sharply
-        dynamic_loss_threshold = 0.5            # accumulated prior-step loss at which the dynamic weight crosses 0.5
+        dynamic_loss_decay = 1.0                # w_r = exp(-decay * sum of prior-step losses); larger cuts off deep steps more sharply
     ):
         """Build the dynamics model and cache which loss terms are active.
 
@@ -354,7 +363,6 @@ class NextLatentWrapper(Module):
 
         self.dynamic_rollout_loss_weight = dynamic_rollout_loss_weight
         self.dynamic_loss_decay = dynamic_loss_decay
-        self.dynamic_loss_threshold = dynamic_loss_threshold
 
         # rollout weights
 
@@ -561,9 +569,11 @@ class NextLatentWrapper(Module):
         # curriculum over rollout depth (added in ce4a20e): step r is discounted by how
         # badly steps 0..r-1 are currently doing, so deep predictions are only pushed once
         # the shallow ones are accurate. Fully detached - this shapes weights, not gradients.
-        # exclusive cumsum along the rollout axis => cum[r] excludes step r's own loss,
-        # so step 0 always gets the constant sigmoid(decay * threshold), and the weight
-        # decays toward 0 for later steps as the accumulated error grows.
+        # exclusive cumsum along the rollout axis => cum[r] excludes step r's own loss, so
+        # w_r = exp(-decay * cum[r]) = prod_{s<r} exp(-decay * L_s): step 0 always gets
+        # exactly 1, and each later step keeps only what survives every earlier step.
+        # (ebe0201 replaced the earlier sigmoid(-decay * (cum - threshold)) form, which gave
+        # step 0 a weight below 1 and needed the extra `dynamic_loss_threshold` kwarg.)
         # granularity is per (rollout step, batch, position), i.e. an easy token can keep
         # training deep rollouts while a hard one in the same batch does not
 
@@ -571,9 +581,7 @@ class NextLatentWrapper(Module):
 
         if self.dynamic_rollout_loss_weight:
             step_latent_loss = reduce(step_latent_loss_unreduced.detach(), 'r b n d -> r b n', 'mean')
-
-            cum_step_latent_loss = exclusive_cumsum(step_latent_loss, dim = 0)
-            dynamic_weights = torch.sigmoid(-self.dynamic_loss_decay * (cum_step_latent_loss - self.dynamic_loss_threshold))
+            dynamic_weights = dynamic_rollout_loss_weights(step_latent_loss, self.dynamic_loss_decay)
 
         # smooth l1 with stop-gradient on target
 

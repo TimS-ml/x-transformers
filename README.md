@@ -2730,7 +2730,7 @@ out = attention(
 ```bibtex
 @misc{xie2025mhcmanifoldconstrainedhyperconnections,
     title   = {mHC: Manifold-Constrained Hyper-Connections},
-    author  = {Zhenda Xie and Yixuan Wei and Huanqi Cao and Chenggang Zhao and Chengqi Deng and Jiashi Li and Damai Dai and Huazuo Gao and Jiang Chang and Liang Zhao and Shangyan Zhou and Zhean Xu and Zhengyan Zhang and Wangding Zeng and Shengding Hu and Yuqing Wang and Jingyang Yuan and Lean Wang and Wenfeng Liang},
+    author  = {Zhenda Xie and Yixuan Wei and Huanqi Cao and Chenggang Zhao and Chengqi Deng and Jiashi Li and Damai Dai and Huazuo Gao and Jiang Chang and Kuai Yu and Liang Zhao and Shangyan Zhou and Zhean Xu and Zhengyan Zhang and Wangding Zeng and Shengding Hu and Yuqing Wang and Jingyang Yuan and Lean Wang and Wenfeng Liang},
     year    = {2025},
     eprint  = {2512.24880},
     archivePrefix = {arXiv},
@@ -2888,6 +2888,89 @@ out = attention(
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2606.23670},
+}
+```
+
+```bibtex
+@misc{gladstone2026explorativemodelingunlockingpretraining,
+    title   = {Explorative Modeling: Unlocking a Third Pretraining Axis and End-to-End Generation},
+    author  = {Alexi Gladstone and Heng Ji and Yilun Du},
+    year    = {2026},
+    eprint  = {2607.27372},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2607.27372},
+}
+```
+
+```bibtex
+@misc{zhou2026hybridgatedattention,
+    title   = {Hybrid Gated Attention},
+    author  = {Zekun Zhou and Ruobing Xie and Lanrui Wang and Weixuan Sun},
+    year    = {2026},
+    eprint  = {2608.11805},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL},
+    url     = {https://arxiv.org/abs/2608.11805},
+}
+```
+
+```bibtex
+@misc{mozer2026recirculation,
+    title   = {Recirculation},
+    author  = {Michael C. Mozer and Shoaib Ahmed Siddiqui and Danny Sawyer and Sunny Sanyal and Rosanne Liu},
+    year    = {2026},
+    eprint  = {2608.17981},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2608.17981},
+}
+```
+
+```bibtex
+@misc{ndubuaku2026controlledstudyattentiononlytransformers,
+    title   = {A Controlled Study of Attention-Only Transformers},
+    author  = {Henry Ndubuaku and Karen Mosoyan and Jakub Mroz and Noah Cylich and Satyajit Kumar and Parkirat Sandhu and Roman Shemet and Justin H Lee},
+    year    = {2026},
+    eprint  = {2607.18363},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2607.18363},
+}
+```
+
+```bibtex
+@misc{qwen3.8flashnext,
+    title  = {{Qwen3.8-Flash-Next}: A New Architecture, Towards Ultimate Cost-Efficiency},
+    author = {{Qwen Team}},
+    month  = {August},
+    year   = {2026},
+    url    = {https://qwen.ai/blog?id=qwen3.8-flash-next}
+}
+```
+
+```bibtex
+@misc{mccoy2026emergent,
+    title  = {The Emergent Symbolic Structure of Artificial Neural Networks},
+    author = {McCoy, R. Thomas and Soulos, Paul and Linzen, Tal and Smolensky, Paul},
+    month  = {August},
+    year   = {2026},
+    eprint = {2608.29530},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL},
+    url    = {https://arxiv.org/abs/2608.29530}
+}
+```
+
+```bibtex
+@misc{wang2026fullbandwidthtransformer,
+    title         = {Full-bandwidth transformer},
+    author        = {Xi Wang and Ziyang Cai and Zheng Zhan and Harry Dong and Ying Fan and Gustavo de Rosa and Tim Pearce and John Langford},
+    year          = {2026},
+    eprint        = {2608.08888},
+    archivePrefix = {arXiv},
+    primaryClass  = {cs.LG},
+    url           = {https://arxiv.org/abs/2608.08888}
 }
 ```
 

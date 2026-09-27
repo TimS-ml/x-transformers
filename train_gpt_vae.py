@@ -17,6 +17,7 @@ Task: Character-level conditional language modeling with continuous latent varia
 """
 
 from x_transformers.gpt_vae import GPTVAE
+from x_transformers import default_device
 
 import random
 import tqdm
@@ -44,6 +45,9 @@ VALIDATE_EVERY  = 100  # Run validation every N batches
 GENERATE_EVERY  = 500  # Generate sample text every N batches to monitor quality
 GENERATE_LENGTH = 512  # Number of characters to generate during sampling
 SEQ_LEN = 512  # Maximum sequence length for training samples
+
+# Pick the best available accelerator (xpu > cuda > mps > cpu), see default_device
+DEVICE = default_device()
 
 # ============================================================================
 # Helper Functions
@@ -108,11 +112,11 @@ model = GPTVAE(
     enc_depth = 3,  # Number of transformer encoder layers (for encoding sequence to latent)
     vae_kl_loss_weight = 1.,  # Weight for KL divergence loss term
     dim_latent = 1  # Dimensionality of continuous latent space (1D for simplicity in this example)
-).cuda()
+).to(DEVICE)
 
 # Fixed latent vector for conditioned text generation during evaluation
 # This 1D latent can be varied to control generation behavior
-latents = tensor([1.]).cuda()
+latents = tensor([1.], device = DEVICE)
 
 # ============================================================================
 # Data Preparation - enwik8 Dataset
@@ -164,7 +168,7 @@ class TextSamplerDataset(Dataset):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
         # Extract sequence of length seq_len + 1 (input + target)
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        return full_seq.to(DEVICE)
 
     def __len__(self):
         """
