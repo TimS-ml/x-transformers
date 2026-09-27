@@ -6,7 +6,7 @@ are symbol anchors of the form `<abbrev>::Class.method` — a dotted Python path
 resolvable with ripgrep or ctags, so they survive re-annotation and upstream
 merges; `scripts/check_doc_symbols.py` verifies they all still resolve. Module
 abbreviations: `xt` = `x_transformers.py`, `attend` = `attend.py`. Tracks
-upstream **v2.24.0**.
+upstream **v2.31.1**.
 
 ## 1. `Attention` (`xt::Attention`)
 
@@ -22,9 +22,22 @@ score computation to `Attend`, then merges heads and projects out.
 | `value_dim_head`, `dim_out` | decoupled value head dim / output dim |
 
 ### QK normalization (cosine-sim attention)
-`qk_norm` with `qk_norm_scale=10` and optional `qk_norm_dim_scale` (per-dim
-learned). Siblings: `qk_rmsnorm`, `k_rmsnorm` (K-only), `value_rmsnorm` — built
-as `xt::MultiheadRMSNorm`, applied inside `xt::Attention.forward`.
+`qk_norm` l2-normalizes q and k, so the dot product is a cosine similarity, and
+`attend::Attend` multiplies it by a temperature:
+
+| Setting | q / k scale | `Attend` scale | Logits at init |
+|---------|-------------|----------------|----------------|
+| `qk_norm` | 1 | `qk_norm_scale` (default 10) | `10 · cos` |
+| `+ qk_norm_dim_scale` | learned per-dim vectors, each initialized to `dim_head ** 0.25` | `dim_head ** -0.5` | `1 · cos`, temperature then learned |
+
+With `qk_norm_dim_scale` the `qk_norm_scale` kwarg is ignored. This is the
+`90a7454` fix for upstream issue #352: before it, q and k were each multiplied
+by `qk_norm_scale` **and** `Attend` scaled by it again (`cos · s^3`), and the
+learned q scale was never applied to q. Memory keys (`num_mem_kv`) now go
+through the same grouped l2norm as the real keys.
+
+Siblings: `qk_rmsnorm`, `k_rmsnorm` (K-only), `value_rmsnorm` — built as
+`xt::MultiheadRMSNorm`, applied inside `xt::Attention.forward`.
 
 ### Performance / attention backend
 - `flash` → routes to `attend::Attend.flash_attn` (`F.scaled_dot_product_attention`).
@@ -51,11 +64,35 @@ group (a single bool, or one bool per cross-attention layer); it emits a
 Mechanism in §2.
 
 ### Gating & scaling
+Hybrid gated attention (HyGA, [arXiv 2608.11805v1]) replaced the AlphaFold2 value
+gate. Two gates can be enabled, and their logits are **summed** before a single
+activation, applied to the attention output in head space `(b h n d)` before the
+heads are merged:
+
+- the **x gate** (`gate_values`) reads the layer input,
+- the **h gate** (`output_gate`) reads the attention output itself.
+
+Each gate is an `xt::LoRALinear`: low rank with a SiLU in the middle
+(`low_rank_silu_gates`, default on) when a rank is given, else a bias-less
+linear. Either one can be headwise (one logit per head, broadcast over the head
+dim) or dimwise.
+
 | Flag | Idea |
 |------|------|
-| `gate_values` | AlphaFold2 sigmoid GLU gate on output (bias init 10) |
+| `gate_values` | x gate on the layer input |
+| `gate_values_rank` / `gate_values_headwise` | x gate bottleneck rank / one logit per head (mutually exclusive) |
+| `output_gate` | h gate on the attention output |
+| `output_gate_rank` / `output_gate_headwise` | h gate bottleneck rank / one logit per head (mutually exclusive) |
+| `low_rank_silu_gates` | SiLU inside the low-rank gates (default `True`) |
 | `swiglu_values` | gate activation sigmoid → SiLU |
 | `gate_value_heads` | per-head output gating ("attend to nothing") |
+
+**Init changed.** The old value gate was a biased linear with weight 0 and bias
+10, so `sigmoid ≈ 1` and the layer started near identity. Both HyGA gates are
+bias-less and zero-initialized, so the summed logit starts at 0: the sigmoid gate
+**halves** the attention output at init, and with `swiglu_values` the SiLU gate
+makes it **exactly zero** until the gate weights move. Checkpoints trained with
+the old gate do not load into the new parameter layout either.
 | `head_scale` | NormFormer per-head output scale `(1,heads,1,1)` |
 | `learned_value_residual_mix` | ResFormer value-residual mixer **(forward via `value_residual`)** |
 
@@ -94,6 +131,15 @@ Executes the attention score → softmax → weighted-sum, returning
   dense `mask` may be given; `q/k/v` are flattened to `(n h d)` and
   `flash_pack_seq_kwargs` is forwarded to `flash_attn_varlen_func` verbatim
   (upstream dropped the older shape/monotonicity validation of `cu_seqlens`).
+  The CUDA and SM80+ checks run in `attend::Attend.flash_attn` against the query's
+  device, no longer in `__init__`, so building the module does not touch CUDA.
+- **Fully masked rows** are zeroed with an unconditional `masked_fill`; the old
+  `row_is_entirely_masked.any()` guard forced a device-to-host sync on every call
+  (upstream #355).
+- `attend::default_device` (re-exported as `default_device`) picks xpu > cuda >
+  mps > cpu, or honors an explicit device. Every train script now uses it in place
+  of `.cuda()`, and rotary / polar math runs under the device-agnostic
+  `xt::disable_autocast` instead of `@autocast('cuda', enabled = False)`.
 
 ### Inverted attention (`inverted_attention`)
 Ordinary attention normalizes over `j` (keys), so each query spreads one unit of
@@ -127,7 +173,8 @@ again. Asserted incompatible with flash in `attend::Attend.__init__`.
 | `custom_activation` | deep-copied activation module, overrides the above |
 | `post_act_ln` | **NormFormer**: LayerNorm after activation |
 | `no_bias` | drop bias on both linears (PaLM) |
-| `zero_init_output` | zero-init final linear |
+| `zero_init_output` | zero-init final linear (wins over `output_proj_depth`) |
+| `output_proj_depth` | set by `AttentionLayers` under `depth_scale_residual = True`: normal init of the out-projection with std `(2 · fan_in · depth) ** -0.5` (`xt::init_depth_scaled_`); also on `xt::Attention` |
 | `softclamp_value` | **deepseek-style** softclamp between linear & activation |
 | `glu_gate_softclamp_value` | softclamp the GLU gate branch |
 | `sublayer_dropout` | dropout after out-projection |
@@ -186,6 +233,7 @@ graph TD
     U -->|Orthogonal| ORT[add only orthogonal component]
     U -->|MV-split| MV[mean-shift α + variance β]
     U -->|HyperConnection| HC[multi-stream α/β mix]
+    U -->|GatedMultiResidual| GMR[multi-stream read / write gates]
 ```
 
 | Class | Symbol | Idea | Enabling flag |
@@ -195,10 +243,25 @@ graph TD
 | `OrthogonalResidualUpdate` | `xt::OrthogonalResidualUpdate` | add only branch component orthogonal to residual, via `xt::orthog_project` ([arXiv 2505.11881]) | `orthog_residual` |
 | `MVSplitResidualUpdate` | `xt::MVSplitResidualUpdate` | mean-variance split: mean-shift (α) + centered/variance (β), optional learned MLPs ([arXiv 2605.06169]) | `mv_split_residual` |
 | `HyperConnection` | `xt::HyperConnection` | learned multi-stream residual mixing (`xt::sinkhorn` α/β; [arXiv 2409.19606]) | `num_residual_streams > 1` |
+| `GatedMultiResidual` | `xt::GatedMultiResidual` | Qwen gated residual over `s` streams: elementwise sigmoid read gate (static logit 1 on stream `layer_index % s`, plus a low-rank dynamic term) averages the RMS-normed streams into the branch input; a per-stream write gate `β = 2·sigmoid(·)`, 1 at init, adds the branch output back. No mixing between streams. | `gated_multi_residual` + `num_residual_streams > 1`, `residual_fn_kwargs = dict(read_gate_rank = r)` |
 
-`gate_residual`, `orthog_residual`, `mv_split_residual` and
-`attn_aggregated_residuals` are mutually exclusive, and the first three may not be
-combined with hyper-connections.
+`gate_residual`, `orthog_residual`, `mv_split_residual`, `gated_multi_residual`
+and `attn_aggregated_residuals` are mutually exclusive, and `gated_multi_residual`
+replaces hyper-connections (it is chosen first when both would apply).
+`gated_multi_residual` also drops the block pre-norm, forbids sandwich norm, and
+forces the final norm on.
+
+### Depth scaling of branch outputs
+Since `0985919`, `depth_scale_residual = True` (`xt::AttentionLayers`) is an
+**init-time** scaling: every attention / feedforward output projection in block
+`k` (1-based) is drawn with std `(2 · fan_in · k) ** -0.5`, as in the OLMo
+"mitchell" init. Before that commit, `True` meant a runtime branch scale of
+`depth ** -0.5`. A float `depth_scale_residual`, or a float `scale_residual`, now
+means a runtime multiplier: each branch is wrapped in `xt::Scale`, which scales
+only the first output tensor so attention intermediates pass through. A float
+`scale_residual` is also truthy, so `xt::Residual` additionally creates its
+learned per-dim residual scale. Both scalings are off under
+`attn_aggregated_residuals`.
 
 ### Layer integrators (a separate slot)
 Applied to `x` *before* the pre-norm, recombining all prior layer hiddens rather
@@ -208,7 +271,12 @@ not `residual_fn` choices:
 | Class | Symbol | Idea | Enabling flag |
 |-------|--------|------|---------------|
 | `DynamicLIMe` | `xt::DynamicLIMe` | learned per-token weighting over prior layer hiddens | `integrate_layers` |
-| `AttentionAggregatedResidual` | `xt::AttentionAggregatedResidual` | attention-pool over all prior hiddens, with rotary/polar encoding the layer-depth distance | `attn_aggregated_residuals` |
+| `AttentionResidual` | `xt::AttentionResidual` | softmax over the depth axis of all prior hiddens, per token. Query `RMSNorm(h + LoRA(RMSNorm(h)))` from the latest hidden `h`, keys `RMSNorm` of each hidden, values the raw hiddens. The LoRA up-projection is zero-init, so the query starts as the normed latest hidden | `attn_aggregated_residuals` (+ `attn_aggregated_residual_kwargs`: `lora_rank`, default 64, `lora_activation`) |
+
+`xt::AttentionResidual` replaced `AttentionAggregatedResidual` (`b9222c7`,
+`96d46fa`). The old class built an `xt::AttentionPool` with rotary or polar
+embeddings of layer-depth distance; that class, and the
+`attn_residuals_last_output_as_query` flag, are gone.
 
 > `orthog_residual` (a residual update) ≠ `orthog_projected_values` (an
 > `xt::Attention` feature). Value-residual (ResFormer) is the separate
@@ -258,6 +326,14 @@ replacing it.
   scheme, `pos_emb = always(0)` — **rotary auto-disables absolute pos emb**.
 - Extras: `post_emb_norm`, `emb_frac_gradient`, `embed_num_tokens`, `ff_deep_embed`
   value embedding.
+- Tied output head: `tie_embedding` logits are now multiplied by
+  `tie_embedding_scale`, default `dim ** -0.5` (unscaled before `d3818bf`).
+  `xval::XValTransformerWrapper` applies the same fixed factor.
+- Hooks **(forward)**: `transform_token_embeds` and `transform_block_inputs`
+  rewrite the token embeddings / block inputs (see `model_inference_flow.md` §1);
+  `excise_prepend_embeds` drops the `prepend_embeds` positions from the returned
+  logits and embeddings when no cache is passed. It raises `TypeError` with
+  `num_output_heads > 1`, where the logits are a tuple at that point.
 
 ## 8. Quick config-flag reference (most-used)
 
@@ -277,6 +353,11 @@ replacing it.
 | Orthogonal residual | `orthog_residual=True` |
 | MV-split residual | `mv_split_residual=True` |
 | Hyper-connections | `num_residual_streams=N` |
+| Gated multi residual (Qwen) | `num_residual_streams=N, gated_multi_residual=True, residual_fn_kwargs=dict(read_gate_rank=r)` |
+| Attention residual over depth | `attn_aggregated_residuals=True` |
+| Depth-scaled output init | `depth_scale_residual=True` |
+| HyGA gated attention | `attn_gate_values=True` and / or `attn_output_gate=True` (+ `attn_*_rank`, `attn_*_headwise`) |
+| Attention-only stack | `only_attn=True` ([arXiv 2607.18363]; no `layers_execute_order`, `unet_skips`, or `'f'` in `custom_layers`) |
 | Looped LM | `looped=True` (requires `pre_and_post_norm=True`) |
 
 [arXiv 2605.12357]: https://arxiv.org/abs/2605.12357
@@ -289,3 +370,5 @@ replacing it.
 [arXiv 2509.10534]: https://arxiv.org/abs/2509.10534
 [arXiv 2606.23670]: https://arxiv.org/abs/2606.23670
 [openreview WgQZNoQ5AB]: https://openreview.net/forum?id=WgQZNoQ5AB
+[arXiv 2608.11805v1]: https://arxiv.org/abs/2608.11805v1
+[arXiv 2607.18363]: https://arxiv.org/abs/2607.18363

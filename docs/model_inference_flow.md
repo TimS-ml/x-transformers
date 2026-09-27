@@ -3,7 +3,8 @@
 How data moves through the stack at train and inference time: the per-layer
 forward, KV caching, autoregressive `generate`, looped/early-exit decoding,
 encoder-decoder cross-attention, Transformer-XL segment memory, end-to-end
-test-time training, and latent-space rollouts.
+test-time training, latent-space rollouts, and feeding deep states back down
+across positions.
 
 Code references here are **symbol anchors**, not line numbers. `` `xt::AttentionLayers.forward` ``
 means the dotted Python path `AttentionLayers.forward` inside `x_transformers.py`.
@@ -12,10 +13,11 @@ with a single ripgrep or ctags lookup and survives re-annotation and upstream
 merges. Abbreviations used below: `xt` = `x_transformers.py`, `attend` =
 `attend.py`, `arw` = `autoregressive_wrapper.py`, `xl` =
 `xl_autoregressive_wrapper.py`, `nlw` = `next_latent_wrapper.py`, `lejepa` =
-`gpt_lejepa.py`. Constructor kwargs and instance attributes are not symbols, so
+`gpt_lejepa.py`, `fb` = `full_bandwidth.py`, `recirc` = `recirculation.py`, `xm` =
+`xm_latent_decoder.py`. Constructor kwargs and instance attributes are not symbols, so
 they are written in prose with their owning class in parentheses — e.g.
 `looped_exit_prob_threshold` (`xt::TransformerWrapper`). `scripts/check_doc_symbols.py`
-verifies that every anchor still resolves. This doc tracks upstream v2.24.0.
+verifies that every anchor still resolves. This doc tracks upstream v2.31.1.
 
 ## 1. Forward pass — `AttentionLayers.forward`
 
@@ -49,12 +51,43 @@ normalized input, then the residual is recombined by calling `residual_fn`.
 | `pre_branch_norm` | iff `pre_norm` | `xt::AttentionLayers.__init__` |
 | `post_branch_norm` (sandwich) | iff `sandwich_norm` (requires pre-norm) | `xt::AttentionLayers.__init__` |
 | `post_main_norm` | iff `not pre_norm` **or** `pre_and_post_norm` | `xt::AttentionLayers.__init__` |
-| final norm | iff `pre_norm and pre_norm_has_final_norm` else `Identity` | `xt::AttentionLayers.__init__` |
+| final norm | iff `pre_norm and pre_norm_has_final_norm`, **or** `gated_multi_residual`; else `Identity` | `xt::AttentionLayers.__init__` |
 
 `pre_and_post_norm` (`xt::AttentionLayers`) forces `pre_norm = True` and turns
 the per-main final norm on while disabling the stack's final norm
 (`pre_norm_has_final_norm = False`, since post-norm already normalizes the
 output) — this is the mode the looped LM requires (§4).
+
+`gated_multi_residual` (`xt::AttentionLayers`) goes the other way: it forces
+`pre_norm = False`, because `xt::GatedMultiResidual.prepare` already RMS-normalizes
+every stream before its read gate, so there is no `pre_branch_norm` and sandwich
+norm is rejected. The final norm is then kept explicitly, since the streams are
+summed at the end of the stack and need normalizing once.
+
+### Blocks: `transform_block_inputs` and `block_hiddens`
+
+A **block** is one repetition of the default block, e.g. `('a','f')`. With
+`custom_layers`, `par_ratio` or `sandwich_coef`, `len_default_block` is 1 and every
+layer counts as its own block; with `only_attn` (`xt::AttentionLayers`) the `'f'`
+entries are filtered out first, so blocks count attention layers only. Inside
+`xt::AttentionLayers.forward`, each layer derives a 1-based `block_depth`:
+
+- `transform_block_inputs` **(forward)**, on both `xt::TransformerWrapper.forward`
+  and `xt::AttentionLayers.forward`, is either a dict `{depth: fn(x)}` or a callable
+  `fn(depth, x)`. For `depth > 1` it rewrites the residual stream at the first
+  layer of that block. Depth 1 is applied by `xt::TransformerWrapper.forward` to
+  the **token embeddings, before the positional embedding is added**, so calling
+  `AttentionLayers` directly never transforms depth 1. `transform_token_embeds`
+  (`xt::TransformerWrapper.forward`) is the older single-hook form and takes
+  priority over depth 1.
+- `block_hiddens` collects the residual stream after each block's last layer
+  (after its `post_main_norm`) and is returned on `xt::LayerIntermediates`. The
+  **last** entry is overwritten with the stack's final output (after softclamp,
+  the multistream sum and the final norm), so it equals `last_hidden`; earlier
+  entries are un-normed and, with several residual streams, still `(b s) n d`.
+
+These two hooks exist for `fb::FullBandwidth` (§9), which feeds each block's
+latent from the previous temporal pass back into the same block.
 
 > `repeat_blocks` / `layers_execute_order` can repeat blocks at forward time for
 > recurrent-depth experiments (`xt::resolve_repeat_blocks_to_layer_execute_order`,
@@ -66,9 +99,11 @@ Two dataclasses carry cache state:
 
 - **`xt::LayerIntermediates`**: `hiddens` (residual stream captured before each
   self-attn layer), `last_layer_hiddens`, `attn_intermediates` (per-attn-layer),
-  `cache_length`, `mems` (XL), and looped-LM fields `exit_logits`,
-  `all_pred_logits`, `exit_indices`, `looped_prompt_kv_cache`.
-  `xt::LayerIntermediates.__copy__` deep-copies the intermediates list.
+  `cache_length`, `mems` (XL), looped-LM fields `exit_logits`,
+  `all_pred_logits`, `exit_indices`, `looped_prompt_kv_cache`, and
+  `block_hiddens` (§1). `xt::LayerIntermediates.__copy__` copies the
+  per-layer intermediates and the `block_hiddens` list, so a copied cache can
+  be mutated without touching the original.
 - **`attend::Intermediates`**: holds `cached_kv` per attention layer.
 
 Threading (`xt::AttentionLayers.forward`): with a cache, the code asserts causal
@@ -116,9 +151,17 @@ sequenceDiagram
   `filter_logits_fn = identity`.
 - **Not present**: classifier-free guidance (`cfg`) and restrict-token-list
   decoding. The only "restrict" is `restrict_to_max_seq_len` (length truncation).
-  Re-checked against `autoregressive_wrapper.py` after the v2.24.0 merge — still
+  Re-checked against `autoregressive_wrapper.py` after the v2.31.1 merge — still
   true; there is no `cfg`, no allowed/banned token list, no logit-bias hook.
-- `arw::AutoregressiveWrapper.beam_search` also available.
+- `arw::AutoregressiveWrapper.beam_search` also available. Since `560e661`
+  (upstream #357) it reorders the kv cache after pruning: candidates are laid out
+  as `(b prev_beams) x beams`, so `flattened_beam_indices // beams` is the parent
+  row each surviving beam extended, and the cache is gathered with it. Before
+  that, a surviving beam could keep decoding on another beam's cached keys and
+  values.
+- With `restrict_to_max_seq_len = False`, `x` is now bound to the full sequence
+  before the truncation branch; previously `x` was only assigned inside that
+  branch and the call raised `NameError`.
 
 ## 4. Looped / early-exit inference
 
@@ -208,7 +251,17 @@ Splits long sequences into `max_seq_len` segments and carries hidden states
 - **memory production** (`xt::TransformerWrapper.forward`, under `return_mems`):
   `new_mems = [cat(pair, dim = -2) for pair in zip(mems, hiddens)]` — the
   concatenation is along the sequence axis, not the default dim 0 — then
-  truncated to the trailing `max_mem_len` positions.
+  truncated to the trailing `max_mem_len` positions with `slice_right_at_dim`
+  (from `torch_einops_utils`). That helper returns an **empty** slice for
+  `max_mem_len = 0`, where the old `t[..., -0:, :]` kept the whole sequence
+  (`93774bb`); `cont::ContinuousTransformerWrapper`, `mi::MultiInputTransformerWrapper`
+  and `xval::XValTransformerWrapper` switched to it as well.
+- **segment boundary in generate**: at a rollover the wrapper re-anchors
+  `curr_pos` to `out.shape[-1]`, so the current-segment slice is empty. Since
+  `93774bb` the last complete segment is re-run instead (the kv cache was just
+  reset); before, the empty slice reached the net and `logits[:, -1]` indexed a
+  zero-length axis. This fires for a prompt whose length is a multiple of
+  `max_seq_len`, and every `max_seq_len` generated tokens.
 - **detaching is opt-out**, not baked in: `detach_mems` (`xt::TransformerWrapper.forward`,
   default `True`) decides whether gradient may cross a segment boundary.
   `xl::XLAutoregressiveWrapper.forward` passes `False` except on truncated-BPTT
@@ -218,7 +271,8 @@ Splits long sequences into `max_seq_len` segments and carries hidden states
 ## 7. End-to-end test-time training (TTT)
 
 `xl_autoregressive_wrapper.py` went from 323 to 1037 lines in the v2.24.0 merge,
-and nearly all of the growth is this one mechanism. It lives in this doc rather
+and nearly all of the growth is this one mechanism (v2.31.1 adds low-rank memory
+targets and a next-latent inner loss, §7.9). It lives in this doc rather
 than in the component docs because it is a runtime and gradient-flow scheme: an
 inner optimizer runs *inside* the forward pass, once per segment, and the outer
 backward differentiates through it. In-source citation, from the module docstring
@@ -230,7 +284,7 @@ graph TD
     CALL[forward / generate called] --> INIT[init_ttt<br/>fast weights := repeat_batch of slow weights]
     INIT --> SEG{next segment}
     SEG --> FWD[net segment, mems, detach_mems<br/>TTTModuleWrapper runs vmap functional_call]
-    FWD --> LOSS[segment loss<br/>CE / NLL, or ttt_custom_loss_module]
+    FWD --> LOSS[per-sample segment loss b<br/>CE / NLL, or ttt_custom_loss_module]
     LOSS --> GRAD[autograd.grad wrt SOURCE fast weights<br/>create_graph = training]
     GRAD --> MUON[optional newtonschulz5<br/>matrices only]
     MUON --> STEP[TARGET fast weights<br/>p := p - lr*g - lr*wd*p]
@@ -274,8 +328,9 @@ dict **and** over every positional argument, so both must carry the batch on
 dim 0. Keyword arguments are closed over by the inner `call_single`, not mapped —
 anything batch-dependent therefore has to arrive positionally. The result is that
 batch element `b` is evaluated entirely on its own weight slice, and because each
-sample only ever touches its own slice, a single `autograd.grad` call on a
-batch-aggregated loss still yields correctly separated per-sample gradients.
+sample only ever touches its own slice, a single `autograd.grad` call on the
+**sum** of the per-sample losses yields each sample exactly its own gradient
+(see §7.4 for why the reduction must be per sample).
 
 ### 7.3 Seeding: `init_ttt`
 
@@ -284,7 +339,8 @@ slow weights at the start of **every** `forward` and `generate`, broadcasting ea
 `nn.Parameter` to `(batch, *shape)` with `xl::repeat_batch`. Two consequences:
 
 - TTT state never persists across calls. Each sequence starts from the slow
-  weights again.
+  weights again. In `forward` the call now sits inside the `torch.enable_grad`
+  context, so seeding also works when the caller wrapped `forward` in `no_grad`.
 - The broadcast is differentiable, so gradient arriving at the fast weights still
   flows back (summed over the batch) into the underlying `nn.Parameter`. This is
   why `ttt_lr = 0` reproduces the non-TTT gradients exactly — asserted in
@@ -295,12 +351,20 @@ slow weights at the start of **every** `forward` and `generate`, broadcasting ea
 
 `xl::XLAutoregressiveWrapper.update_ttt` is the entry point. It:
 
-1. builds a scalar segment loss,
+1. builds a **per-sample** segment loss of shape `(b,)`, reduced over the
+   sequence only (`masked_mean(loss, mask, dim = -1)`),
 2. differentiates it w.r.t. the **source** wrappers' fast weights
    (`torch.autograd.grad(..., allow_unused = True)` — a source module absent from
    a custom loss's graph comes back `None` and is skipped),
 3. optionally pushes each gradient through Newton-Schulz (§7.5),
 4. applies `p <- p - lr*g - lr*wd*p` to the **target** wrappers' fast weights.
+
+The per-sample reduction is a fix from `e5b145e`. Until then the loss was one
+scalar mean over every token in the batch, which scaled each sample's
+fast-weight gradient by its share of the batch's tokens, roughly `1 / b`, so the
+memory write depended on batch size. With per-sample losses summed before
+`autograd.grad`, a sequence gets the same write alone or in a batch —
+`test_ttt_write_batch_size_independent` checks exactly that.
 
 The weight decay is decoupled (AdamW-style: not folded into the gradient).
 Defaults are `ttt_lr = 1e-3` and `ttt_wd = 0.01` (`xl::XLAutoregressiveWrapper`).
@@ -328,7 +392,8 @@ Neither side is detached, and the encoder and both heads are ordinary parameters
 of the module — they get gradient because the outer backward differentiates
 through the inner update they drive, so the outer optimizer meta-learns *what
 target the inner loop should chase*. `train_xl_enwik8.py` selects it with
-`--ttt_custom_loss`.
+`--ttt_custom_loss`. `ttt_next_latent_loss = True` installs the other shipped
+option, `xl::TTTNextLatentPredictionLoss` (§7.9).
 
 ### 7.5 Muon path
 
@@ -437,6 +502,34 @@ weight.
 Runnable example: `train_xl_enwik8.py` (`--e2e_ttt` points `ttt_module_paths` at
 a value projection near the top of the decoder and uses `tbptt_steps = 2`).
 
+### 7.9 Low-rank memories and the next-latent inner loss (v2.31.1)
+
+**`ttt_low_rank_paths`** (`xl::XLAutoregressiveWrapper`) takes `(path, rank)`
+pairs. Each named `nn.Linear` is first replaced by `xl::LowRankLinear`, then
+wrapped by `xl::TTTModuleWrapper` like any other TTT target, and its path is
+appended to the source/target map as `(path, path)`.
+
+- `xl::LowRankLinear` computes `x @ (A @ B)^T + bias` with `A` of shape
+  `(out, r)` drawn from `N(0, 1)` and `B` of shape `(r, in)` zero-initialized. The
+  product is zero at init, so gradient reaches `B` through the random `A`, and the
+  memory builds up in the two factors.
+- **The original weight is discarded**, not kept as `W + A @ B`. After the swap
+  the layer outputs only its bias until the factors move, so point this at a
+  layer whose pretrained contents you do not need, or at one added for the
+  purpose. The bias is copied over and becomes a fast weight too.
+- Under `episodic_mem_len > 0` the low-rank paths get the same `net.` prefix as
+  the other paths.
+
+**`ttt_next_latent_loss = True`** installs `xl::TTTNextLatentPredictionLoss` as
+the custom loss (it is asserted exclusive with `ttt_custom_loss_module`), with
+`dim` read from `net.attn_layers.dim`. A LayerNorm + 3-layer GELU MLP predicts, at
+each position, the next position's last-layer hidden: the target is the hiddens
+rolled left by one **with wrap-around** (the last position predicts the window's
+first) and detached. The loss is smooth-L1 (or MSE) averaged over features into an
+unreduced `(b n)` tensor; position `i` is masked when the label at `i + 1` is
+ignored. As with the KL example, the predictor's parameters are ordinary outer
+parameters, trained through the differentiable inner update.
+
 ## 8. Latent-space rollouts (no token decoding)
 
 Two wrappers unroll a small predictor **in latent space** for several steps, with
@@ -494,11 +587,13 @@ graph LR
   to the dynamics model and the encoder. It requires `to_logits` to be a Module
   (the default `LinearNoBias`, not the tied-embedding lambda variant of
   `xt::TransformerWrapper`).
-- **Dynamic rollout loss weighting**:
-  `sigmoid(-decay * (exclusive_cumsum(step_loss, dim=0) - threshold))`, fully
-  detached. Because the cumsum is exclusive along the rollout axis, step `r` is
-  discounted by how badly steps `0..r-1` are currently doing — a curriculum on
-  unroll depth. Step 0 always gets the constant `sigmoid(decay * threshold)`.
+- **Dynamic rollout loss weighting** (`nlw::dynamic_rollout_loss_weights`):
+  `exp(-decay * exclusive_cumsum(step_loss, dim=0))`, fully detached. Because the
+  cumsum is exclusive along the rollout axis, step `r` is discounted by how badly
+  steps `0..r-1` are currently doing — a curriculum on unroll depth. Equivalently
+  `w_r = prod_{s<r} exp(-decay * L_s)`, so step 0 always gets exactly 1. (`ebe0201`
+  replaced the earlier `sigmoid(-decay * (cumsum - threshold))` form and removed
+  the `dynamic_loss_threshold` kwarg.)
   Granularity is per `(rollout step, batch, position)`, so an easy token can keep
   training deep rollouts while a hard one in the same batch does not. It shapes
   weights, never gradients, and the same weights are reused for the KL term.
@@ -574,6 +669,35 @@ embedding, guarded against collapse by a distributional SIGReg term, with
 cross-entropy demoted to a detached probe. NextLatent's target is the next hidden
 state, guarded by a frozen-head KL distillation term in logit space, with
 cross-entropy still training the trunk as the primary objective.
+
+## 9. Feeding deep states back down (v2.31.1)
+
+Two new wrappers attack the same limit — within one position, information only
+moves up the stack, so the serial computation that can carry a running state is
+bounded by depth — with opposite runtime shapes. Both feed a deeper block's output
+at position `t - 1` into a shallower block at position `t`; they differ in how the
+sequential dependency is computed.
+
+| | `fb::FullBandwidth` | `recirc::Recirculation` |
+|---|---|---|
+| Where the state enters | `transform_block_inputs` (§1): the transition's output becomes the destination block's input, residual stream included (token embeddings at depth 1) | forward pre-hook on the destination layer's pre-norm: replaces only the attention branch input; the skip path keeps the unmixed stream |
+| Training | `temporal_parallel_passes` full-sequence passes, each fusing the previous pass's block latents shifted right by one — Jacobi iteration, exact on the first `p` positions after `p` passes | strictly sequential: one token at a time, first pass + replay per token (2 calls/token), BPTT through the whole chain |
+| Decoding | prefill with the passes, then one cached network call per token with the previous step's latents fused in (the exact recurrence) | per token: first pass (logits read here), strip that token's kv, replay with the mixed state, keep the replayed kv |
+| What later tokens see | fused streams → changed keys / values at and above the destination | replayed keys / values at and above the destination |
+| Mixing | learned transition per route (`glu` default) | `α · norm_matched(z_src) + β · z_dest`, fixed or via `recirc::RecirculationMixer` |
+
+Consequence for evaluation: `fb::FullBandwidth.forward` scores a sequence with a
+truncated recurrence (`passes - 1` feedback steps), while
+`fb::FullBandwidth.generate` runs the untruncated one, so prompt positions beyond
+the pass count and the decoded tokens are computed under different depths of
+feedback. `recirc::Recirculation` has no such gap — training and decoding run the
+same per-token loop — at the cost of no parallelism over the sequence.
+
+`xm::XMLatentDecoder` is the other new runtime pattern worth knowing: at
+inference `xm::XMLatentDecoder.generate_with_candidate_latents` runs candidate
+selection on the prompt before decoding, so it costs `candidates` extra prompt
+forwards per explored slot, and it needs an explicit label-free `winner_fn` (the
+default one raises `IndexError` there, see `architecture_overview.md` §10.3).
 
 [arXiv 2510.25741]: https://arxiv.org/abs/2510.25741
 [arXiv 2512.23675]: https://arxiv.org/abs/2512.23675

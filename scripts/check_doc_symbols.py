@@ -57,6 +57,10 @@ ABBREV = {
     "up": "up_wrapper.py",
     "xval": "xval.py",
     "dpo": "dpo.py",
+    "fb": "full_bandwidth.py",
+    "recirc": "recirculation.py",
+    "xm": "xm_latent_decoder.py",
+    "disc": "discover_wrapper.py",
 }
 
 ANCHOR = re.compile(r"`([a-z_]+)::([A-Za-z_][A-Za-z0-9_.]*)`")
