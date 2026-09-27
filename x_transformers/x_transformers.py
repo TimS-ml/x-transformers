@@ -92,6 +92,9 @@ def exists(val):
     return val is not None
 
 def disable_autocast(fn):
+    # device-agnostic replacement for @autocast('cuda', enabled = False): reads the device type
+    # off the first tensor argument, so the fp32 island around rotary / polar math also holds
+    # under xpu / mps / cpu autocast. raises StopIteration if the call has no tensor argument
     @wraps(fn)
     def inner(*args, **kwargs):
         tensor_arg = next(arg for arg in (*args, *kwargs.values()) if is_tensor(arg))
@@ -1051,6 +1054,10 @@ def apply_polar_pos_emb(t, freqs):
 class LoRALinear(Module):
     """ low-rank linear projection with optional activation in the middle (silu for the HyGA gates), or a bias-less linear when no rank is given """
 
+    # with `dim` (the rank) unset, construction short-circuits to a plain zero-initialized
+    # LinearNoBias - so the returned object is NOT a LoRALinear instance in that case.
+    # both paths output exactly zero at init (up / linear zero-initialized), which is why
+    # the gates and query deltas built on it start from their static / identity values
     def __new__(cls, dim_in, dim_out = None, dim = None, activation = None):
         dim_out = default(dim_out, dim_in)
 
@@ -1082,6 +1089,10 @@ class LoRALinear(Module):
 # helper modules
 
 class Scale(Module):
+    # multiplies the first tensor leaf of fn's output by `scale` and passes every other leaf
+    # through, so it can wrap branches that return (out, intermediates) tuples or nested
+    # structures. short-circuits when scale is None or 1. used for the macaron 0.5 ff and for
+    # the runtime `residual_scale` (maybe_scale_output in AttentionLayers)
     def __init__(self, scale, fn: Module | None = None):
         super().__init__()
         self.scale = scale
@@ -1638,6 +1649,18 @@ class GatedMultiResidual(Module):
         https://qwen.ai/blog?id=qwen3.8-flash-next
 
         Gated residual - elementwise low rank read gate over the residual streams, per stream scalar write gate
+
+        A lighter alternative to HyperConnection with the same prepare() / forward() interface.
+        The batch carries the s streams folded in, as (b s) n d.
+
+          read   branch_input = (1 / s) * sum_s  sigmoid(read_logit[s, d]) * gain[s, d] * rmsnorm(stream_s)
+                 read_logit = static (1 on stream `layer_index % s`, 0 elsewhere) + low-rank dynamic term
+          write  stream_s <- stream_s + beta_s * branch_output,  beta_s = 2 * sigmoid(write_logit_s) in (0, 2)
+
+        No mixing between streams (unlike the sinkhorn matrix of HyperConnection): each stream only
+        accumulates the branch output, scaled per stream and per token. The read gate normalizes
+        its input, which is why AttentionLayers drops the block pre-norm for this residual.
+        `read_gate_rank` is required (AttentionLayers passes it through residual_fn_kwargs).
         """
         super().__init__()
 
@@ -1677,12 +1700,18 @@ class GatedMultiResidual(Module):
         streams = self.num_residual_streams
         views = self.num_input_views
 
+        # unfold the streams from the batch: (b s) n d -> b n s d
+
         residuals = rearrange(residuals, '(b s) n d -> b n s d', s = streams)
+
+        # the gate input sees all streams at once, (b n (s d)), scaled down by the stream count
 
         normed = self.read_norm(residuals) * self.read_gain
         flat = rearrange(normed, 'b n s d -> b n (s d)') / streams
 
         # shared low rank bottleneck for the read and write gates
+
+        # (b n r); both projections out of it are zero-initialized, and dynamic_gate_scale starts at 1e-2
 
         dynamic = F.silu(self.to_bottleneck(flat)) * self.dynamic_gate_scale
 
@@ -1691,16 +1720,20 @@ class GatedMultiResidual(Module):
         read_gate = self.to_read_gate(dynamic) + rearrange(self.static_read_logit, 'v s d -> 1 1 (v s d)')
         read_gate = rearrange(read_gate.sigmoid(), 'b n (v s d) -> v b n s d', v = views, s = streams)
 
+        # gated average over streams per view; one view -> (b n d), three views -> (3 b n d) for q / k / v
+
         branch_input = reduce(read_gate * normed, 'v b n s d -> v b n d', 'sum') / streams
         branch_input = branch_input[0] if views == 1 else branch_input
 
         # write gate - per stream scalar, static + dynamic
 
-        beta = (self.to_write_gate(dynamic) + self.static_write_logit).sigmoid() * 2
+        beta = (self.to_write_gate(dynamic) + self.static_write_logit).sigmoid() * 2   # (b n s), 1 at init
 
         return branch_input, residuals, dict(beta = beta)
 
     def forward(self, x, residuals, *, beta, **kwargs):
+        # broadcast the branch output x (b n d) into every stream with its own beta, then refold the
+        # streams into the batch for the next layer
         residuals = einsum('b n d, b n s -> b n s d', x, beta) + residuals
         return rearrange(residuals, 'b n s d -> (b s) n d')
 
@@ -2217,6 +2250,12 @@ class Attention(Module):
         self.to_v_gate = LoRALinear(dim, heads if gate_values_headwise else out_dim, dim = gate_values_rank, activation = gate_activation) if gate_values else None
         self.to_output_gate = LoRALinear(out_dim, heads if output_gate_headwise else out_dim, dim = output_gate_rank, activation = gate_activation) if output_gate else None
 
+        # init behavior changed with this rewrite: the old alphafold2-style value gate was a biased
+        # Linear with weight 0 and bias 10, i.e. sigmoid ~ 1 (near identity) at init. both gates are
+        # now bias-less and zero-initialized (LoRALinear), so the summed gate logit starts at 0:
+        # the sigmoid gate halves the attention output at init, and with swiglu_values the silu
+        # gate makes it exactly zero until the gate weights move
+
         self.to_head_space_headwise = Rearrange('b n h -> b h n 1')
         self.to_head_space_dimwise = Rearrange('b n (h d) -> b h n d', h = heads)
 
@@ -2239,6 +2278,16 @@ class Attention(Module):
         # whether to use the rmsnorm (equivalent to cosine sim attention when scale is equal to 1) - https://arxiv.org/abs/2302.05442
 
         self.qk_norm_dim_scale = qk_norm_dim_scale
+
+        # qk_norm temperature (fixed in 90a7454, upstream issue #352). l2-normed q and k give
+        # cosine similarities, which Attend multiplies by `scale`:
+        #   plain qk_norm       -> logits = qk_norm_scale * cos (q/k scales stay 1)
+        #   qk_norm_dim_scale   -> learned per-dim q and k scales, each initialized to
+        #                          dim_head ** 0.25, and Attend's scale becomes dim_head ** -0.5,
+        #                          so logits start at exactly 1 * cos and the temperature is
+        #                          learned; the `qk_norm_scale` kwarg is ignored on this path
+        # before the fix, q and k were each multiplied by qk_norm_scale AND Attend scaled by it
+        # again (cos * s^3), and the learned q scale was never applied to q at all
 
         self.qk_norm_q_scale = self.qk_norm_k_scale = 1
 
@@ -2897,8 +2946,13 @@ class Attention(Module):
             if exists(self.to_v_gate):
                 gate_logits = gate_logits + self.to_v_gate_head_space(self.to_v_gate(x))
 
+            # the h gate reads the attention output itself (b n (h d)), the x gate reads the layer input
+
             if exists(self.to_output_gate):
                 gate_logits = gate_logits + self.to_output_gate_head_space(self.to_output_gate(out))
+
+            # one activation on the summed logits (sigmoid, or silu with swiglu_values), applied in
+            # head space (b h n d), then heads merged back to (b n (h d)) for the output projection
 
             out = self.to_head_space_dimwise(out) * self.to_v_gate_activation(gate_logits)
 
@@ -2998,10 +3052,10 @@ class AttentionLayers(Module):
         gate_residual = False,
         orthog_residual = False,
         mv_split_residual = False,
-        gated_multi_residual = False,
-        scale_residual = False,
+        gated_multi_residual = False,           # qwen gated residual over num_residual_streams (> 1) streams; replaces hyper connections and drops the block pre-norm
+        scale_residual = False,                 # True: learned per-dim residual scale in the residual_fn; a float additionally scales every branch output at runtime (see residual_scale below)
         scale_residual_constant = 1.,
-        depth_scale_residual = False,
+        depth_scale_residual = False,           # True: init each branch output projection with std (2 * fan_in * block_depth) ** -0.5; a float: runtime branch output scale
         shift_tokens = 0,
         sandwich_norm = False,
         softclamp_output = False,
@@ -3195,6 +3249,9 @@ class AttentionLayers(Module):
         if macaron:
             default_block = ('f',) + default_block
 
+        # attention-only transformer: every 'f' is dropped from the block, so len_default_block
+        # (and therefore block_ind / block_depth below) counts attention layers only
+
         if only_attn:
             default_block = tuple(filter(not_equals('f'), default_block))
 
@@ -3303,6 +3360,13 @@ class AttentionLayers(Module):
         # boolean `depth_scale_residual` scales the residual branch output projections at init (as in the olmo 'mitchell' init)
         # while a float value scales the branch output at runtime
 
+        # precedence for the runtime scale: attn_aggregated_residuals (forces 1., i.e. off) > float
+        # depth_scale_residual > float scale_residual. both depth scalings are switched off under
+        # attn_aggregated_residuals. note a float scale_residual is also truthy, so the residual_fn
+        # built below additionally gets its learned per-dim `residual_scale` parameter
+        # (before 0985919, boolean True meant a runtime branch scale of depth ** -0.5; it now means
+        # the init-time scaling instead. zero_init_output on a layer still wins over it)
+
         depth_scale_branch_output = isinstance(depth_scale_residual, bool) and depth_scale_residual and not attn_aggregated_residuals
 
         residual_scale = None
@@ -3316,6 +3380,9 @@ class AttentionLayers(Module):
 
         self.depth_scale_residual = depth_scale_branch_output
         self.residual_scale = residual_scale
+
+        # wraps each branch (after post_branch_fn / layerscale) in Scale, which multiplies only the
+        # first output tensor, so attention intermediates pass through unscaled
 
         maybe_scale_output = maybe(partial(Scale, residual_scale)) if (exists(residual_scale) and residual_scale != 1.) else identity
 
@@ -3340,6 +3407,9 @@ class AttentionLayers(Module):
         # whether it has post norm
 
         # final norm kept, always for gated multi residual
+
+        # (pre_norm was forced to False above for gated_multi_residual, so without the `or` it
+        # would lose its final norm - the streams are summed in forward and then normalized here)
 
         keep_final_norm = (pre_norm and pre_norm_has_final_norm) or gated_multi_residual
 
@@ -3830,6 +3900,11 @@ class AttentionLayers(Module):
 
         # go through the attention and feedforward layers
 
+        # a "block" is one repetition of the default block, e.g. ('a', 'f'); with custom_layers,
+        # par_ratio or sandwich_coef len_default_block is 1, so every layer is its own block.
+        # block_hiddens collects the residual stream after each block's last layer (after its
+        # post_main_norm); FullBandwidth reads these via LayerIntermediates.block_hiddens
+
         block_hiddens = []
 
         for ind, (layer_type, skip_combine, (norm, block, residual_fn), layer_dropout, layer_integrator) in enumerate(zip(*layer_variables)):
@@ -3841,6 +3916,9 @@ class AttentionLayers(Module):
             block_end = divisible_by(ind + 1, self.len_default_block) or is_last
 
             # maybe transform block inputs (for depths > 1)
+            # block_depth is 1-based. depth 1 is handled by TransformerWrapper on the token embeddings
+            # (before the positional embedding is added), so calling AttentionLayers directly never
+            # transforms depth 1. a dict maps depth -> fn(x); a callable is called as fn(depth, x)
 
             if block_begin and block_depth > 1 and exists(transform_block_inputs):
                 if isinstance(transform_block_inputs, dict) and block_depth in transform_block_inputs:
@@ -3965,6 +4043,10 @@ class AttentionLayers(Module):
 
         if not return_hiddens:
             return x
+
+        # the last block's entry is swapped for the final output, i.e. after softclamp, the
+        # multistream sum and the final norm - so it matches `last_hidden`. earlier entries are
+        # un-normed and, with multiple residual streams, still (b s) n d
 
         if len(block_hiddens) > 0:
             block_hiddens[-1] = x
@@ -4202,7 +4284,7 @@ class TransformerWrapper(Module):
         num_memory_tokens = None,
         memory_tokens_interspersed_every = None,
         tie_embedding = False,
-        tie_embedding_scale: float | None = None,
+        tie_embedding_scale: float | None = None,   # multiplier on tied-embedding logits; None -> dim ** -0.5 (tied logits were unscaled before d3818bf)
         logits_dim = None,
         return_only_embed = False,
         num_output_heads = 1,
@@ -4453,11 +4535,11 @@ class TransformerWrapper(Module):
         pos = None,
         prepend_embeds = None,
         prepend_mask = None,
-        excise_prepend_embeds = False,
+        excise_prepend_embeds = False,  # drop the prepend_embeds positions from the returned logits / embeddings (skipped when a cache is passed)
         embed_ids: dict[str, Tensor] = dict(),
         sum_embeds = None,
-        transform_token_embeds = None,
-        transform_block_inputs: dict[int, Callable] | Callable | None = None,
+        transform_token_embeds = None,  # fn(token_embeds) applied before the positional embedding is added; takes priority over depth 1 of transform_block_inputs
+        transform_block_inputs: dict[int, Callable] | Callable | None = None,  # per-block input hook, {depth: fn(x)} or fn(depth, x); depth 1 = token embeds here, depths > 1 in AttentionLayers
         return_attn_z_loss = False,
         attn_z_loss_weight = 1e-4,
         seq_start_pos = None,
@@ -4872,6 +4954,9 @@ class TransformerWrapper(Module):
 
         # maybe excise prepended embeddings
 
+        # note: with num_output_heads > 1 `logits` is a tuple at this point, and the slice below
+        # raises TypeError (tuple indices must be integers or slices)
+
         if exists(prepend_embeds) and excise_prepend_embeds and not exists(cache):
             prepend_len = prepend_embeds.shape[1]
             if exists(logits):
@@ -4917,6 +5002,9 @@ class TransformerWrapper(Module):
         if return_mems:
             hiddens = intermediates.hiddens
             new_mems = [cat(pair, dim = -2) for pair in zip(mems, hiddens)] if exists(mems) else hiddens
+
+            # keep the last max_mem_len positions. slice_right_at_dim returns an empty slice for
+            # max_mem_len = 0, where the old t[..., -0:, :] kept the whole sequence (93774bb)
 
             new_mems = [slice_right_at_dim(t, self.max_mem_len, dim = -2) for t in new_mems]
 

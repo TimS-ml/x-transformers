@@ -277,6 +277,10 @@ class LowRankLinear(Module):
         # two low rank matrices, no weight matrix, the memories will be stored in these
         # the memory is initially zero, but one of the matrices is randomly initialized so the gradients can flow into it
 
+        # note the original weight is discarded, not kept as W + A @ B: after the swap the layer
+        # computes x @ (A @ B)^T + bias, which is exactly the bias alone at init, so whatever the
+        # wrapped Linear had learned is gone. A (out, r) ~ N(0, 1) unscaled, B (r, in) = 0
+
         self.weight_a = nn.Parameter(torch.randn(out_dim, low_rank_dim))
         self.weight_b = nn.Parameter(torch.zeros(low_rank_dim, in_dim))
 
@@ -443,9 +447,12 @@ class TTTNextLatentPredictionLoss(Module):
             raise ValueError(f'unknown loss type {loss_type}')
 
     def forward(self, intermediates, mask = None):
+        # returns an unreduced (b n) loss; update_ttt reduces it per sample
         hiddens = intermediates.last_layer_hiddens
 
         # the last token predicts the first token in the window
+        # i.e. the target is the hiddens rolled left by one with wrap-around, detached, so the
+        # predictor and the fast weights are trained toward the net's own next latent
 
         pred = self.predictor(hiddens)
         target = cat((hiddens[:, 1:], hiddens[:, :1]), dim = 1).detach()
@@ -492,7 +499,7 @@ class XLAutoregressiveWrapper(Module):
         ttt_use_muon = False,                           # orthogonalize inner-loop gradients with Newton-Schulz before stepping
         ttt_muon_steps = 5,                             # Newton-Schulz iterations per update
         ttt_muon_lr = 1e-2,                             # separate step size for parameters that Muon actually applied to (matrices only)
-        ttt_low_rank_paths = tuple(),                   # (path, rank) pairs: swap that Linear for a zero-product LowRankLinear and test-time-train only its two factors
+        ttt_low_rank_paths = tuple(),                   # (path, rank) pairs: swap that Linear for a LowRankLinear (A @ B, product zero at init; the original weight is dropped) and test-time-train its factors (and bias, if any)
         ttt_custom_loss_module: Module | None = None,   # replaces the LM loss as the inner-loop objective; called as (intermediates, mask = ...)
         ttt_next_latent_loss = False,                   # shortcut for ttt_custom_loss_module = TTTNextLatentPredictionLoss(dim = net.attn_layers.dim)
         episodic_mem_len = 0                            # > 0 adds a learned per-layer kv bank; usable as a dedicated long-term TTT target
@@ -944,9 +951,8 @@ class XLAutoregressiveWrapper(Module):
             # segment rollover: re-anchor `curr_pos` to the segment start, adopt the mems
             # produced by the completed segment and drop the intra-segment kv cache, so
             # the finished segment is reached only through `mems` from here on.
-            # careful - because `curr_pos` is set to `out.shape[-1]`, the slice below is
-            # empty on exactly the iterations where this branch fires, and `logits[:, -1]`
-            # then indexes a zero-length axis
+            # because `curr_pos` is set to `out.shape[-1]`, the slice below comes back empty
+            # on exactly the iterations where this branch fires - handled just below
 
             if is_last_segment_tokens:
                 curr_pos = curr_segment_len
@@ -958,6 +964,11 @@ class XLAutoregressiveWrapper(Module):
             # themselves, so handing them the whole suffix is intentional
 
             x = out[:, curr_pos:]
+
+            # added in 93774bb: before it, the empty slice went through the net and
+            # `logits[:, -1]` indexed a zero-length axis. hit whenever the sequence sits exactly
+            # on a boundary - a prompt whose length is a multiple of max_seq_len, or every
+            # max_seq_len generated tokens. `cache` was just reset, so the segment is re-run in full
 
             if x.shape[-1] == 0:
                 # the tokens end exactly on a segment boundary, recompute the last complete segment with a fresh cache

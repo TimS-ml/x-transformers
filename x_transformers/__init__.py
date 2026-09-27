@@ -47,6 +47,17 @@ Utilities:
     - EntropyBasedTokenizer: Tokenizer based on entropy
     - layer_schedule: Builds a per-layer tuple tapering a hyperparameter
       (ff_mult, dropout, ...) from `start` to `end` across `depth`
+    - default_device: Picks xpu > cuda > mps > cpu, or honors an explicit device
+
+Not re-exported here (import from their modules):
+    - x_transformers.full_bandwidth.FullBandwidth: full-bandwidth transformer
+      (Xi Wang et al.) - temporal parallel passes that feed block latents back in
+    - x_transformers.recirculation.Recirculation: the recirculation idea from
+      Mozer et al., with RecirculationMixer
+    - x_transformers.xm_latent_decoder.XMLatentDecoder: encoder-free latent variable
+      decoder trained with explorative modeling (XM)
+    - x_transformers.discover_wrapper.DiscoverDecoder / TPREncoder: DISCOVER
+      (McCoy et al.) - tensor product representation probe on a bottleneck decoder
 
 For detailed documentation on each component, see their respective modules.
 """

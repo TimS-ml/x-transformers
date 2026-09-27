@@ -58,6 +58,8 @@ def default(val, d):
     return val if exists(val) else d
 
 def default_device(device = None):
+    # an explicit device wins; otherwise the first available of xpu > cuda > mps > cpu.
+    # re-exported from the package root, and what every train script now uses instead of .cuda()
     if exists(device):
         return torch.device(device)
 
@@ -403,6 +405,9 @@ class Attend(Module):
                 except ImportError:
                     raise ImportError("block masking with Flash Attention requires the flash-attn package. Please install it with `pip install flash-attn`.")
 
+                # the SM80+ capability check that used to sit here now runs in flash_attn against the
+                # query's device, so constructing the module no longer calls into CUDA
+
             # torch 2.3 uses new backend and context manager
             if torch_version >= version.parse('2.3'):
                 from torch.nn.attention import SDPBackend
@@ -543,6 +548,7 @@ class Attend(Module):
             assert exists(flash_pack_seq_kwargs), 'flash_pack_seq_kwargs must be provided'
             assert not exists(mask), 'mask cannot be passed for block masking'
             assert q.shape[0] == k.shape[0] == v.shape[0] == 1, 'batch size must be 1 for sequence packing'
+            # moved here from __init__: checks the device the tensors are actually on
             assert device.type == 'cuda', 'flash-attn packed sequence masking is only available on CUDA devices'
 
             major, minor = torch.cuda.get_device_capability(device)
@@ -574,6 +580,8 @@ class Attend(Module):
                 )
 
         # for a row that is entirely masked out, should zero out the output of that row token
+        # applied unconditionally: the old `and row_is_entirely_masked.any()` guard forced a
+        # device -> host sync every call (upstream #355), and masked_fill is a no-op when all False
 
         if exists(row_is_entirely_masked):
             out = out.masked_fill(row_is_entirely_masked[..., None], 0.)

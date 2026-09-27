@@ -11,6 +11,9 @@ from typing import Dict
 
 from einops import pack, rearrange, repeat, unpack
 
+# math, rearrange, Decoder and calc_z_loss were referenced in forward but never imported
+# until 7066ebc, so memory_tokens_interspersed_every and return_attn_z_loss raised NameError
+
 from x_transformers.x_transformers import (
     AttentionLayers,
     Decoder,

@@ -657,6 +657,11 @@ class AutoregressiveWrapper(Module):
                 # Keep only top beam sequences
                 out = out[flattened_beam_indices]
 
+                # reorder the kv cache to follow the surviving beams (560e661, upstream #357). candidate
+                # rows were laid out as (b prev_beams) x beams, so integer-dividing a flattened
+                # candidate index by `beams` recovers the row of the parent sequence it extended.
+                # without this, each surviving beam kept decoding on another beam's cached keys / values
+
                 if should_cache:
                     parent_beam_indices = flattened_beam_indices // beams
                     modify_cached_kv(cache, lambda t: t[parent_beam_indices])

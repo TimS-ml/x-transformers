@@ -31,8 +31,8 @@ from x_transformers.x_transformers import (
     ScaledSinusoidalEmbedding,
     AbsolutePositionalEmbedding,
     always,
-    pad_at_dim,
-    slice_right_at_dim
+    pad_at_dim,         # used in forward for memory tokens + mask; missing before 7066ebc, which raised NameError there
+    slice_right_at_dim  # keeps the last n positions, and nothing (not everything) when n = 0
 )
 
 from x_transformers.autoregressive_wrapper import (
@@ -176,6 +176,7 @@ class XValTransformerWrapper(nn.Module):
 
         # Output projection to vocabulary
         logits_dim = default(logits_dim, num_tokens)
+        # tied logits are scaled by dim ** -0.5 (fixed, no kwarg here, unlike TransformerWrapper.tie_embedding_scale)
         self.to_logits = nn.Linear(dim, logits_dim) if not tie_embedding else lambda t: (t @ self.token_emb.emb.weight.t()) * (dim ** -0.5)
 
         # Output projection to numerical value (single scalar per position)
